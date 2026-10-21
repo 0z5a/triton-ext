@@ -4,7 +4,8 @@
 /// from lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp and
 /// lib/Conversion/TritonToTritonGPU/TritonGPUConversion.cpp, with additional
 /// addDynamicallyLegalOp and GenericOpPattern entries for
-/// ttg.local_store, ttg.local_load, and ttg.async_copy_global_to_local.
+/// ttg.local_store, ttg.local_load, ttg.async_copy_global_to_local, and (on
+/// NVIDIA targets) ttng.warp_group_dot_wait.
 ///
 /// Exports pass functions used by tritonGetPluginInfo() in
 /// uTLXPlugin.cpp.
@@ -12,15 +13,13 @@
 // ---------------------------------------------------------------------------
 // Includes from TritonToTritonGPUPass.cpp
 // ---------------------------------------------------------------------------
-#ifdef UTLX_HAS_AMDGPU
-#include "Dialect/TritonAMDGPU/IR/Dialect.h"
-#endif
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -34,6 +33,9 @@
 // ---------------------------------------------------------------------------
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Support/LLVM.h"
+
+// TLX dialect (tlx.require_layout / tlx.release_layout conversion)
+#include "tlx/dialect/include/IR/Dialect.h"
 
 // ---------------------------------------------------------------------------
 // Plugin API (pass functions referenced from TLXLocalAllocPlugin.cpp)
@@ -70,6 +72,53 @@ template <class Op> struct GenericOpPattern : public OpConversionPattern<Op> {
     rewriter.replaceOpWithNewOp<Op>(op, retTypes, adaptor.getOperands(),
                                     op->getAttrs());
 
+    return success();
+  }
+};
+
+// --- TLX explicit register-layout ops -------------------------------------
+//
+// tlx.require_layout carries the encoding the kernel asked for in its *result*
+// type, so that type must survive the conversion untouched; only the operand is
+// remapped. tlx.release_layout is the reverse: its result is unencoded, so the
+// type converter picks the default blocked encoding. Both become
+// ttg.convert_layout.
+//
+// Without these the ops are left unconverted with original-typed operands,
+// which newer MLIR reports as "failed to legalize unresolved source
+// materialization ... that remained live after conversion".
+//
+// MemDesc-typed require_layout is left alone: shared-memory encodings are
+// settled later by tlx-insert-and-propagate-layout.
+struct TlxRequireLayoutPattern
+    : public OpConversionPattern<mlir::triton::tlx::RequireLayoutOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(mlir::triton::tlx::RequireLayoutOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto resTy = dyn_cast<RankedTensorType>(op.getType());
+    if (!resTy || !resTy.getEncoding())
+      return failure();
+    rewriter.replaceOpWithNewOp<triton::gpu::ConvertLayoutOp>(op, resTy,
+                                                              adaptor.getSrc());
+    return success();
+  }
+};
+
+struct TlxReleaseLayoutPattern
+    : public OpConversionPattern<mlir::triton::tlx::ReleaseLayoutOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(mlir::triton::tlx::ReleaseLayoutOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto resTy = dyn_cast_or_null<RankedTensorType>(
+        getTypeConverter()->convertType(op.getType()));
+    if (!resTy)
+      return failure();
+    rewriter.replaceOpWithNewOp<triton::gpu::ConvertLayoutOp>(op, resTy,
+                                                              adaptor.getSrc());
     return success();
   }
 };
@@ -117,7 +166,7 @@ void populateArithPatternsAndLegality(TritonGPUTypeConverter &typeConverter,
       GenericOpPattern<arith::RemSIOp>, GenericOpPattern<arith::AndIOp>,
       GenericOpPattern<arith::OrIOp>, GenericOpPattern<arith::XOrIOp>,
       GenericOpPattern<arith::ShLIOp>, GenericOpPattern<arith::ShRUIOp>,
-      GenericOpPattern<arith::ShRSIOp>, // NegFOp
+      GenericOpPattern<arith::ShRSIOp>, GenericOpPattern<arith::NegFOp>,
       // Floating point
       GenericOpPattern<arith::AddFOp>, GenericOpPattern<arith::SubFOp>,
       // MaxMin
@@ -295,50 +344,9 @@ struct TritonDotPattern : public OpConversionPattern<triton::DotOp> {
   }
 };
 
-struct TritonCatPattern : public OpConversionPattern<triton::CatOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(triton::CatOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    // The cat op satisfy two conditions:
-    // 1. output.numel = lhs.numel + rhs.numel
-    // 2. output.total_elems_per_thread =
-    // next_power_of_2(lhs.total_elems_per_thread + rhs.total_elems_per_thread)
-    // For now, this behaves like generic, but this
-    // will evolve when we add support for `can_reorder=False`.
-    auto retType = cast<RankedTensorType>(
-        this->getTypeConverter()->convertType(op.getType()));
-    auto retEncoding =
-        cast<triton::gpu::BlockedEncodingAttr>(retType.getEncoding());
-    auto lhsType = adaptor.getLhs().getType();
-    auto rhsType = adaptor.getRhs().getType();
-    auto lhsTotalElemsPerThread = triton::gpu::getTotalElemsPerThread(lhsType);
-    auto rhsTotalElemsPerThread = triton::gpu::getTotalElemsPerThread(rhsType);
-    auto retTotalElemsPerThread = triton::gpu::getTotalElemsPerThread(retType);
-    auto retShape = retType.getShape();
-    auto retOrder = retEncoding.getOrder();
-    auto retThreadsPerWarp = retEncoding.getThreadsPerWarp();
-    auto retWarpsPerCTA = retEncoding.getWarpsPerCTA();
-    // Get new retSizePerThread if ret elems per thread is not enough.
-    // We have to round it up to the next power of 2 due to triton's tensor size
-    // constraint.
-    auto newRetTotalElemsPerThread =
-        nextPowOf2(lhsTotalElemsPerThread + rhsTotalElemsPerThread);
-    auto newRetSizePerThread = llvm::to_vector(retEncoding.getSizePerThread());
-    newRetSizePerThread[retOrder[0]] *=
-        newRetTotalElemsPerThread / retTotalElemsPerThread;
-    triton::gpu::BlockedEncodingAttr newRetEncoding =
-        triton::gpu::BlockedEncodingAttr::get(
-            getContext(), newRetSizePerThread, retThreadsPerWarp,
-            retWarpsPerCTA, retOrder, retEncoding.getCGALayout());
-    auto newRetType = retType.cloneWithEncoding(newRetEncoding);
-    addNamedAttrs(rewriter.replaceOpWithNewOp<triton::CatOp>(
-                      op, newRetType, adaptor.getOperands()),
-                  adaptor.getAttributes());
-    return success();
-  }
-};
+// TritonCatPattern removed: triton::CatOp no longer exists in Triton
+// (the pinned commit in ci/triton-hash.txt has no TT_CatOp), so the
+// pattern could not compile. Nothing to convert -- drop it.
 
 struct TritonJoinOpPattern : public OpConversionPattern<triton::JoinOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -566,6 +574,29 @@ public:
   }
 };
 
+// tlx.release_layout exists to hand a value back to the layout-free world of
+// TTIR, where tensors carry no encoding. In TTGIR every tensor has one, so the
+// op has nothing left to express: rewrite it to a convert_layout into whatever
+// the type converter chose for its result. Leaving it alone produces a tensor
+// with no encoding at all, which downstream passes cannot reason about --
+// TritonGPUReduceDataDuplication is the first to fall over.
+struct TLXReleaseLayoutPattern
+    : public OpConversionPattern<mlir::triton::tlx::ReleaseLayoutOp> {
+  using OpConversionPattern<
+      mlir::triton::tlx::ReleaseLayoutOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(mlir::triton::tlx::ReleaseLayoutOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto retType = this->getTypeConverter()->convertType(op.getType());
+    if (!retType)
+      return failure();
+    rewriter.replaceOpWithNewOp<triton::gpu::ConvertLayoutOp>(op, retType,
+                                                              adaptor.getSrc());
+    return success();
+  }
+};
+
 void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
                             RewritePatternSet &patterns, unsigned numCTAs) {
   MLIRContext *context = patterns.getContext();
@@ -580,8 +611,8 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       GenericOpPattern<triton::SplatOp>,
       GenericOpPattern<triton::UnsplatOp>,
       GenericOpPattern<triton::AddPtrOp>,
+      TLXReleaseLayoutPattern,
       TritonBroadcastPattern,
-      TritonCatPattern,
       TritonJoinOpPattern,
       TritonSplitOpPattern,
       GenericOpPattern<triton::ClampFOp>,
@@ -837,7 +868,8 @@ public:
 
   StringRef getDescription() const override {
     return "Plugin version of ConvertTritonToTritonGPU with additional "
-           "legalization for ttg.local_store/local_load/async_copy ops";
+           "legalization for ttg.local_store/local_load/async_copy ops and, "
+           "on NVIDIA, ttng.warp_group_dot_wait";
   }
 
   void runOnOperation() override {
@@ -852,26 +884,38 @@ public:
     // --- Conversion target (from TritonGPUConversion.cpp) ---
     TritonGPUConversionTarget convTarget(*context, typeConverter);
 
-    // TLX addition: override blanket TritonGPUDialect legality for ops that
-    // may appear with unencoded tensor types from plugin custom ops.
+    // TLX addition: override blanket TritonGPUDialect (and, below,
+    // TritonNvidiaGPUDialect) legality for ops that may appear with unencoded
+    // tensor types from plugin custom ops. Op-level legality takes precedence
+    // over the dialect-level addLegalDialect.
+    auto allTensorsEncoded = [](Operation *op) -> bool {
+      for (auto operandType : op->getOperandTypes()) {
+        if (auto rtt = dyn_cast<RankedTensorType>(operandType)) {
+          if (!rtt.getEncoding())
+            return false;
+        }
+      }
+      for (auto resultType : op->getResultTypes()) {
+        if (auto rtt = dyn_cast<RankedTensorType>(resultType)) {
+          if (!rtt.getEncoding())
+            return false;
+        }
+      }
+      return true;
+    };
     convTarget.addDynamicallyLegalOp<triton::gpu::AsyncCopyGlobalToLocalOp,
                                      triton::gpu::LocalLoadOp,
                                      triton::gpu::LocalStoreOp>(
-        [](Operation *op) -> bool {
-          for (auto operandType : op->getOperandTypes()) {
-            if (auto rtt = dyn_cast<RankedTensorType>(operandType)) {
-              if (!rtt.getEncoding())
-                return false;
-            }
-          }
-          for (auto resultType : op->getResultTypes()) {
-            if (auto rtt = dyn_cast<RankedTensorType>(resultType)) {
-              if (!rtt.getEncoding())
-                return false;
-            }
-          }
-          return true;
-        });
+        allTensorsEncoded);
+
+    // TLX addition, NVIDIA only: tlx.async_dot_wait (ttng.warp_group_dot_wait,
+    // Hopper wgmma) can wait on a value with no encoding, e.g. an accumulator
+    // carried out of a loop through tlx.release_layout. AMD has no wgmma and
+    // never emits the op.
+    const bool isCuda = target.find("cuda:") == 0;
+    if (isCuda)
+      convTarget.addDynamicallyLegalOp<triton::nvidia_gpu::WarpGroupDotWaitOp>(
+          allTensorsEncoded);
 
     // TLX addition: on AMD targets, rewrite ttng.init_barrier →
     // amdg.init_barrier before the conversion, since the AMD backend
@@ -880,19 +924,30 @@ public:
     // (e.g. ttng.init_barrier on NVIDIA) pass through unchanged.
     // On AMD, we also mark amdg legal for the rewritten ops.
     convTarget.addLegalDialect<triton::nvidia_gpu::TritonNvidiaGPUDialect>();
-#ifdef UTLX_HAS_AMDGPU
-    bool isAMD = target.find("hip:") == 0;
-    if (isAMD) {
-      OpBuilder builder(context);
-      mod.walk([&](triton::nvidia_gpu::InitBarrierOp op) {
-        builder.setInsertionPoint(op);
-        triton::amdgpu::InitBarrierOp::create(builder, op.getLoc(),
-                                              op.getAlloc(), op.getCount());
-        op.erase();
-      });
-      convTarget.addLegalDialect<triton::amdgpu::TritonAMDGPUDialect>();
+
+    // Built by registered name rather than by linking against
+    // triton::amdgpu::InitBarrierOp, the same way ops/NewOps.cpp handles ops it
+    // cannot include. The Triton wheel ships no third_party/amd headers -- and
+    // none of the generated .h.inc the dialect header needs -- so a wheel-based
+    // build can never define UTLX_HAS_AMDGPU, which is what left these ops
+    // unlowered. The dialect itself is present at runtime; note its name is
+    // `amdg`, not `amdgpu` (that is MLIR's own unrelated dialect).
+    if (target.find("hip:") == 0) {
+      auto initBarrier =
+          RegisteredOperationName::lookup("amdg.init_barrier", context);
+      if (initBarrier) {
+        OpBuilder builder(context);
+        mod.walk([&](triton::nvidia_gpu::InitBarrierOp op) {
+          builder.setInsertionPoint(op);
+          OperationState state(op.getLoc(), *initBarrier);
+          state.addOperands({op.getAlloc()});
+          state.addAttribute("count", builder.getI32IntegerAttr(op.getCount()));
+          builder.create(state);
+          op.erase();
+        });
+        convTarget.addLegalDialect("amdg");
+      }
     }
-#endif
 
     // --- Rewrite patterns (from TritonToTritonGPUPass.cpp) ---
     RewritePatternSet patterns(context);
@@ -904,6 +959,18 @@ public:
     populateSCFPatterns(typeConverter, patterns);
     populateCFPatterns(typeConverter, patterns);
     patterns.insert<GenericOpPattern<ub::PoisonOp>>(typeConverter, context);
+    if (isCuda)
+      patterns.insert<GenericOpPattern<triton::nvidia_gpu::WarpGroupDotWaitOp>>(
+          typeConverter, context);
+    patterns.insert<TlxRequireLayoutPattern, TlxReleaseLayoutPattern>(
+        typeConverter, context);
+    // Tensor-typed layout ops must be converted; MemDesc-typed require_layout
+    // is settled later by tlx-insert-and-propagate-layout, so leave it legal.
+    convTarget.addDynamicallyLegalOp<mlir::triton::tlx::RequireLayoutOp>(
+        [](mlir::triton::tlx::RequireLayoutOp op) {
+          return !isa<RankedTensorType>(op.getType());
+        });
+    convTarget.addIllegalOp<mlir::triton::tlx::ReleaseLayoutOp>();
 
     // Set module attributes (same as upstream ConvertTritonToTritonGPU).
     Builder b(&getContext());
@@ -929,7 +996,10 @@ private:
 // After accelerate_matmul assigns DotOperandEncodingAttr to dot inputs,
 // this pass finds LocalLoadOps feeding DotOps and updates their source
 // MemDesc encodings to match what the dots require, propagating backward
-// through the MemDesc def chain (MemDescIndexOp → LocalAllocOp).
+// through the MemDesc def chain (MemDescIndexOp → LocalAllocOp) and forward
+// to the other views of the same buffer. Across a MemDescTransOp the encoding
+// is permuted, as in Meta's fork's LayoutPropagation, so the transposed view
+// stays verifier-consistent.
 // ===========================================================================
 
 class TLXInsertAndPropagateLayout
@@ -946,32 +1016,106 @@ public:
            "requirements (combined InsertRequireLayout + PropagateLayout)";
   }
 
-  void propagateEncodingBackward(Value memDesc, Attribute targetEncoding,
-                                 DenseSet<Value> &visited) {
+  // The encoding a MemDescTransOp's source needs for its result to carry
+  // `resultEncoding`: the dialect's transpose inference, run with the inverse
+  // permutation.
+  static FailureOr<Attribute>
+  inferTransSourceEncoding(triton::gpu::MemDescTransOp transOp,
+                           Attribute resultEncoding) {
+    auto order = transOp.getOrder();
+    SmallVector<int32_t> inverse(order.size());
+    for (auto [i, dim] : llvm::enumerate(order))
+      inverse[dim] = i;
+    auto *inferLayout = dyn_cast<triton::DialectInferLayoutInterface>(
+        &resultEncoding.getDialect());
+    Attribute srcEncoding;
+    if (!inferLayout || failed(inferLayout->inferTransOpEncoding(
+                            resultEncoding, transOp.getType().getShape(),
+                            inverse, srcEncoding, transOp.getLoc())))
+      return failure();
+    return srcEncoding;
+  }
+
+  // The encoding a MemDescTransOp's result has when its source carries
+  // `srcEncoding`.
+  static FailureOr<Attribute>
+  inferTransResultEncoding(triton::gpu::MemDescTransOp transOp,
+                           Attribute srcEncoding) {
+    auto *inferLayout = dyn_cast<triton::DialectInferLayoutInterface>(
+        &srcEncoding.getDialect());
+    Attribute resultEncoding;
+    if (!inferLayout ||
+        failed(inferLayout->inferTransOpEncoding(
+            srcEncoding, transOp.getSrc().getType().getShape(),
+            transOp.getOrder(), resultEncoding, transOp.getLoc())))
+      return failure();
+    return resultEncoding;
+  }
+
+  // Give `memDesc` the encoding `targetEncoding`, then carry it to every view
+  // of the same buffer: backward through the def chain to the allocation, and
+  // forward from each value to the views taken of it (e.g. the memdesc_index a
+  // prologue async_copy writes through), so all of them agree.
+  LogicalResult propagateEncoding(Value memDesc, Attribute targetEncoding,
+                                  DenseSet<Value> &visited) {
     if (!visited.insert(memDesc).second)
-      return;
+      return success();
 
     auto memDescType = dyn_cast<triton::gpu::MemDescType>(memDesc.getType());
     if (!memDescType)
-      return;
+      return success();
 
     auto newType = triton::gpu::MemDescType::get(
         memDescType.getShape(), memDescType.getElementType(), targetEncoding,
         memDescType.getMemorySpace(), memDescType.getMutableMemory());
     memDesc.setType(newType);
 
-    if (auto defOp = memDesc.getDefiningOp()) {
-      for (auto operand : defOp->getOperands()) {
-        if (isa<triton::gpu::MemDescType>(operand.getType()))
-          propagateEncodingBackward(operand, targetEncoding, visited);
+    if (auto *defOp = memDesc.getDefiningOp()) {
+      if (auto transOp = dyn_cast<triton::gpu::MemDescTransOp>(defOp)) {
+        FailureOr<Attribute> srcEncoding =
+            inferTransSourceEncoding(transOp, targetEncoding);
+        if (failed(srcEncoding))
+          return transOp.emitError("cannot infer the source encoding of a "
+                                   "transposed view of ")
+                 << targetEncoding;
+        if (failed(propagateEncoding(transOp.getSrc(), *srcEncoding, visited)))
+          return failure();
+      } else {
+        for (auto operand : defOp->getOperands()) {
+          if (isa<triton::gpu::MemDescType>(operand.getType()) &&
+              failed(propagateEncoding(operand, targetEncoding, visited)))
+            return failure();
+        }
       }
     }
+
+    for (Operation *user : llvm::make_early_inc_range(memDesc.getUsers())) {
+      if (auto transOp = dyn_cast<triton::gpu::MemDescTransOp>(user)) {
+        if (transOp.getSrc() != memDesc)
+          continue;
+        FailureOr<Attribute> resultEncoding =
+            inferTransResultEncoding(transOp, targetEncoding);
+        if (failed(resultEncoding))
+          return transOp.emitError("cannot infer the encoding of a "
+                                   "transposed view of ")
+                 << targetEncoding;
+        if (failed(propagateEncoding(transOp.getResult(), *resultEncoding,
+                                     visited)))
+          return failure();
+      } else if (isa<triton::gpu::MemDescIndexOp,
+                     triton::gpu::MemDescSubsliceOp>(user)) {
+        if (failed(
+                propagateEncoding(user->getResult(0), targetEncoding, visited)))
+          return failure();
+      }
+    }
+    return success();
   }
 
   void runOnOperation() override {
     ModuleOp mod = getOperation();
 
-    mod.walk([&](triton::DotOp dotOp) {
+    WalkResult result = mod.walk([&](triton::DotOp dotOp) {
       SetVector<Operation *> backwardSet;
       BackwardSliceOptions options;
       options.inclusive = false;
@@ -991,12 +1135,39 @@ public:
         if (!encoding)
           continue;
 
+        // The derived encoding takes its order from the loaded registers.
+        // Keep the order the memdesc already has instead, as fbtriton does: for
+        // a transposed view of a row-major load (tlx.local_trans) the register
+        // order would make the buffer column-major, which no direct-to-LDS
+        // async copy can write.
+        auto srcType = cast<triton::gpu::MemDescType>(
+            localLoadOp->getOperand(0).getType());
+        // Padded and shared-linear encodings only come from an explicit
+        // tlx.local_alloc(layout=...): the kernel pinned that image (and sized
+        // its async copies for it), so it is not ours to retag.
+        if (isa_and_nonnull<triton::gpu::PaddedSharedEncodingAttr,
+                            triton::gpu::SharedLinearEncodingAttr>(
+                srcType.getEncoding()))
+          continue;
+        if (isa_and_nonnull<triton::gpu::SharedEncodingTrait>(
+                srcType.getEncoding())) {
+          SmallVector<unsigned> userOrder = triton::gpu::getOrder(srcType);
+          if (ArrayRef<unsigned>(userOrder) != encoding.getOrder())
+            encoding = triton::gpu::SwizzledSharedEncodingAttr::get(
+                encoding.getContext(), encoding.getVec(),
+                encoding.getPerPhase(), encoding.getMaxPhase(), userOrder,
+                encoding.getCGALayout());
+        }
+
         DenseSet<Value> visited;
-        propagateEncodingBackward(localLoadOp->getOperand(0),
-                                  cast<Attribute>(encoding), visited);
+        if (failed(propagateEncoding(localLoadOp->getOperand(0),
+                                     cast<Attribute>(encoding), visited)))
+          return WalkResult::interrupt();
       }
       return WalkResult::advance();
     });
+    if (result.wasInterrupted())
+      signalPassFailure();
   }
 };
 

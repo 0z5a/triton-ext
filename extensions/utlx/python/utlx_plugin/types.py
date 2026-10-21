@@ -5,12 +5,29 @@ storage_alias_spec, reuse_group, tensor_memory_layout, etc.
 """
 
 import enum
+import hashlib
 from abc import abstractmethod
 from typing import List, Optional
 
 import triton.language.core as tl
 from triton._C.libtriton import ir
 from triton.language.core import _aggregate as aggregate
+from triton.runtime.jit import constexpr_function
+
+
+class tlx_value(tl.base_value):
+    """Base for TLX values that wrap a single IR handle.
+
+    `tl.base_value._set_name` is abstract. Upstream's code generator calls it
+    on every value bound to a named variable, so without an implementation any
+    `x = tlx.local_alloc(...)` raises a bare `NotImplementedError`. Meta's fork
+    never hits this because its code generator does not name TLX values.
+    Mirrors `tl.tensor._set_name`.
+    """
+
+    def _set_name(self, builder, name: str) -> None:
+        self.handle.set_loc(
+            builder.create_name_loc(name, self.handle.get_loc()))
 
 
 class layout_encoding:
@@ -21,7 +38,7 @@ class layout_encoding:
     def __repr__(self):
         return self.__class__.__name__
 
-    def to_ir(self, builder: ir.builder) -> None:
+    def to_ir(self, builder: ir.builder) -> ir.attribute:
         raise NotImplementedError(
             f"{self.__class__.__name__}.to_ir() must be overridden in subclasses"
         )
@@ -38,7 +55,7 @@ class shared_layout_encoding(layout_encoding):
             f"{self.__class__.__name__}.make_permute() must be overridden in subclasses"
         )
 
-    def to_ir(self, builder: ir.builder) -> None:
+    def to_ir(self, builder: ir.builder) -> ir.attribute:
         raise NotImplementedError(
             f"{self.__class__.__name__}.to_ir() must be overridden in subclasses"
         )
@@ -93,7 +110,7 @@ class swizzled_shared_layout_encoding(shared_layout_encoding):
             self.numCTAOrder,
         )
 
-    def to_ir(self, builder: ir.builder) -> None:
+    def to_ir(self, builder: ir.builder) -> ir.attribute:
         return builder.make_swizzled_shared_encoding_attr(
             self.vectorSize,
             self.perPhase,
@@ -103,6 +120,209 @@ class swizzled_shared_layout_encoding(shared_layout_encoding):
             self.numCTASplit,
             self.numCTAOrder,
         )
+
+
+class _value_layout:
+    """Equality, hashing, repr and mangling by field values.
+
+    Jit specializations are keyed and mangled on constexpr arguments, so two
+    different explicit layouts must neither compare nor mangle the same.
+    """
+
+    def _key(self):
+        return tuple(sorted((k, repr(v)) for k, v in vars(self).items()))
+
+    def __eq__(self, other):
+        return type(self) is type(other) and self._key() == other._key()
+
+    def __hash__(self):
+        return hash((type(self).__name__, self._key()))
+
+    def __repr__(self):
+        fields = ", ".join(f"{k}={v}" for k, v in self._key())
+        return f"{type(self).__name__}({fields})"
+
+    def mangle(self):
+        # Identifier-safe and short; the bases make the repr very long.
+        digest = hashlib.sha1(repr(self).encode()).hexdigest()[:12]
+        return f"{type(self).__name__}_{digest}"
+
+
+def _identity_offset_bases(shape, order):
+    """Offset bases of the identity map: dims in ``order``, low bits first."""
+    rank = len(shape)
+    bases = []
+    for dim in order:
+        size = int(shape[dim])
+        assert size > 0 and size & (size - 1) == 0, \
+            f"padded_shared identity layout needs power-of-two dims, got {shape}"
+        for bit in range(size.bit_length() - 1):
+            bases.append([1 << bit if i == dim else 0 for i in range(rank)])
+    return bases
+
+
+class padded_shared_layout_encoding(_value_layout, shared_layout_encoding):
+    """``#ttg.padded_shared``: interval padding over a linear offset map.
+
+    Built either in the identity form (``with_identity_for``: ``order`` and
+    ``shape`` describe a row-major-in-``order`` map) or from explicit offset
+    bases (``with_bases``), which pins a permuted/swizzled image. Both lower to
+    upstream's ``get_padded_shared_layout``, which takes the bases directly, so
+    the identity form computes them here.
+    """
+
+    def __init__(self,
+                 intervals,
+                 paddings,
+                 order,
+                 shape,
+                 numCTAsPerCGA=None,
+                 numCTASplit=None,
+                 numCTAOrder=None,
+                 offset_bases=None,
+                 block_bases=None):
+        super().__init__()
+        assert len(intervals) == len(paddings), \
+            "intervals and paddings must have the same length"
+        rank = len(shape)
+        self.intervals = [int(i) for i in intervals]
+        self.paddings = [int(p) for p in paddings]
+        self.order = [int(o) for o in order]
+        self.shape = [int(s) for s in shape]
+        self.numCTAsPerCGA = list(numCTAsPerCGA or [1] * rank)
+        self.numCTASplit = list(numCTASplit or [1] * rank)
+        self.numCTAOrder = list(numCTAOrder or range(rank))
+        self.offset_bases = None if offset_bases is None else [
+            [int(x) for x in b] for b in offset_bases
+        ]
+        self.block_bases = None if block_bases is None else [
+            [int(x) for x in b] for b in block_bases
+        ]
+
+    @staticmethod
+    @constexpr_function
+    def with_bases(interval_padding_pairs,
+                   offset_bases,
+                   shape,
+                   block_bases=None):
+        rank = len(shape)
+        assert rank > 0, "shape must be non-empty"
+        assert len(offset_bases) > 0, "offset_bases must be non-empty"
+        for b in list(offset_bases) + list(block_bases or []):
+            assert len(b) == rank, \
+                f"each base vector must have length rank={rank}, got {b}"
+        return padded_shared_layout_encoding(
+            intervals=[int(p[0]) for p in interval_padding_pairs],
+            paddings=[int(p[1]) for p in interval_padding_pairs],
+            order=list(reversed(range(rank))),
+            shape=list(shape),
+            offset_bases=offset_bases,
+            block_bases=block_bases or [],
+        )
+
+    @staticmethod
+    @constexpr_function
+    def with_identity_for(interval_padding_pairs, shape, order=None):
+        rank = len(shape)
+        if order is None:
+            order = list(reversed(range(rank)))
+        return padded_shared_layout_encoding(
+            intervals=[int(p[0]) for p in interval_padding_pairs],
+            paddings=[int(p[1]) for p in interval_padding_pairs],
+            order=list(order),
+            shape=list(shape),
+        )
+
+    def make_permute(self, dims):
+        offset_bases = None
+        if self.offset_bases is not None:
+            offset_bases = [[b[d] for d in dims] for b in self.offset_bases]
+        block_bases = None
+        if self.block_bases is not None:
+            block_bases = [[b[d] for d in dims] for b in self.block_bases]
+        return padded_shared_layout_encoding(
+            intervals=self.intervals,
+            paddings=self.paddings,
+            order=[self.order[d] for d in dims],
+            shape=[self.shape[d] for d in dims],
+            offset_bases=offset_bases,
+            block_bases=block_bases,
+        )
+
+    def to_ir(self, builder: ir.builder) -> ir.attribute:
+        offset_bases = self.offset_bases
+        if offset_bases is None:
+            offset_bases = _identity_offset_bases(self.shape, self.order)
+        # The last argument is the CGA layout; uTLX is single-CTA.
+        return builder.get_padded_shared_layout(self.intervals, self.paddings,
+                                                offset_bases, [], self.shape)
+
+
+class shared_linear_layout_encoding(_value_layout, shared_layout_encoding):
+    """``#ttg.shared_linear``: an explicit offset-bit to tensor-dim map."""
+
+    # Set by from_nv_mma only. Declared, not assigned, so plain instances keep
+    # the fields _value_layout keys equality and mangling on.
+    tile_shape: List[int]
+
+    def __init__(self, offset_bases, block_bases=None, alignment=16):
+        super().__init__()
+        self.offset_bases = [[int(x) for x in b] for b in offset_bases]
+        self.block_bases = [[int(x) for x in b] for b in (block_bases or [])]
+        self.alignment = int(alignment)
+        assert self.offset_bases and len(self.offset_bases[0]) > 0
+        rank = len(self.offset_bases[0])
+        assert all(len(b) == rank for b in self.offset_bases)
+        assert all(len(b) == rank for b in self.block_bases)
+        assert self.alignment > 0 and \
+            (self.alignment & (self.alignment - 1)) == 0
+
+    @classmethod
+    def from_nv_mma(cls, atom_layout, tile_shape, alignment=1024):
+        """An NVMMA atom tiled out to ``tile_shape``.
+
+        The bases are left to ``to_ir``, which derives them from the atom with
+        a builder, as the fork does.
+        """
+        result = cls.__new__(cls)
+        shared_layout_encoding.__init__(result)
+        result.offset_bases = []
+        result.block_bases = []
+        result.alignment = int(alignment)
+        result._nv_mma_atom = atom_layout
+        result.tile_shape = [int(d) for d in tile_shape]
+        assert len(result.tile_shape) == len(atom_layout.shape)
+        assert result.alignment > 0 and \
+            (result.alignment & (result.alignment - 1)) == 0
+        return result
+
+    def make_permute(self, dims):
+        if getattr(self, "_nv_mma_atom", None) is not None:
+            return shared_linear_layout_encoding.from_nv_mma(
+                self._nv_mma_atom.make_permute(dims),
+                [self.tile_shape[d] for d in dims], self.alignment)
+        # A physical image: keep the bit bases and let the consumer's
+        # memdesc_trans describe the logical permutation (as the fork does).
+        return self
+
+    def to_ir(self, builder: ir.builder) -> ir.attribute:
+        atom = getattr(self, "_nv_mma_atom", None)
+        if atom is not None:
+            return builder.make_nv_mma_tiled_shared_linear_encoding_attr(
+                [int(x) for x in atom.shape],
+                [int(x) for x in atom.order],
+                atom.elemType.to_ir(builder),
+                atom.numCTAsPerCGA,
+                atom.numCTASplit,
+                atom.numCTAOrder,
+                atom.fp4Padded,
+                atom.swizzled,
+                self.tile_shape,
+                self.alignment,
+            )
+        return builder.get_shared_linear_layout(self.offset_bases,
+                                                self.block_bases,
+                                                self.alignment)
 
 
 class tensor_memory_layout_encoding(shared_layout_encoding):
@@ -128,7 +348,7 @@ class tensor_memory_layout_encoding(shared_layout_encoding):
     def make_permute(self, dims):
         return self
 
-    def to_ir(self, builder: ir.builder) -> None:
+    def to_ir(self, builder: ir.builder) -> ir.attribute:
         return builder.make_tensor_memory_encoding_attr(
             self.blockM,
             self.blockN,
@@ -188,11 +408,22 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
             self.swizzled,
         )
 
+    def tile_to_shape(self, tile_shape, alignment=1024):
+        return shared_linear_layout_encoding.from_nv_mma(
+            self, tile_shape, alignment)
+
+    def make_shared_linear(self, alignment=1024, tile_shape=None):
+        return self.tile_to_shape(tile_shape or self.shape, alignment)
+
     def __str__(self) -> str:
         return (
             f"nv_mma_shared_layout_encoding<{self.shape}, {self.order}, {self.elemType}, "
             f"{self.numCTAsPerCGA}, {self.numCTASplit}, {self.numCTAOrder}, "
             f"{self.fp4Padded}, {self.swizzled}>")
+
+    # By value, not identity: a tiled shared_linear_layout_encoding holds this
+    # atom and keys its equality and mangling on the atom's repr.
+    __repr__ = __str__
 
     def __eq__(self, other) -> bool:
         return (type(self) is type(other) and self.shape == other.shape
@@ -204,7 +435,7 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
                 and self.fp4Padded == other.fp4Padded
                 and self.swizzled == other.swizzled)
 
-    def to_ir(self, builder: ir.builder) -> None:
+    def to_ir(self, builder: ir.builder) -> ir.attribute:
         return builder.make_nv_mma_shared_encoding_attr(
             [int(x) for x in self.shape],
             self.order,
@@ -227,9 +458,118 @@ class tensor_memory_scales_layout_encoding:
     def make_default(cls):
         return cls(CTASplitM=1, CTASplitN=1)
 
-    def to_ir(self, builder: ir.builder) -> None:
+    def to_ir(self, builder: ir.builder) -> ir.attribute:
         return builder.make_tensor_memory_scales_encoding_attr(
             self.CTASplitM, self.CTASplitN)
+
+
+def _modes_to_flat_strides(shape, stride):
+    """Expand a shape:stride list of modes into per-bit flat strides.
+
+    ``shape`` is a tuple of power-of-two mode extents and ``stride`` the
+    matching tuple of scalar flat offsets. A mode ``(2^k, s)`` contributes the
+    ``k`` bit-strides ``s, 2s, 4s, ..., 2^(k-1) s`` -- the GF(2) decomposition a
+    linear layout is written in.
+    """
+    assert len(shape) == len(stride), \
+        "layout: shape and stride must have the same number of modes"
+    flat = []
+    for extent, s in zip(shape, stride):
+        extent = int(extent)
+        s = int(s)
+        assert extent & (extent - 1) == 0, \
+            f"layout mode extent {extent} must be a power of two"
+        b = 1
+        while b < extent:
+            flat.append(s * b)
+            b <<= 1
+    return flat
+
+
+def _flat_to_coord(flat, tensor_shape):
+    """Decode a flat row-major offset into a per-dimension coordinate vector."""
+    coord = []
+    for d in range(len(tensor_shape)):
+        dim_stride = 1
+        for later in tensor_shape[d + 1:]:
+            dim_stride *= int(later)
+        coord.append((flat // dim_stride) % int(tensor_shape[d]))
+    return coord
+
+
+class layout(layout_encoding):
+    """A user-specified distributed (register) layout, as CuTe shape/stride.
+
+    The layout has two top-level modes, ``(thread, value)``::
+
+        shape  = (thread_shape, value_shape)
+        stride = (thread_stride, value_stride)
+
+    Each ``*_shape`` is a tuple of power-of-two extents and each ``*_stride``
+    the matching tuple of flat, row-major offsets into the tile. Each mode
+    ``(2^k, s)`` decomposes into bits ``s, 2s, ..., 2^(k-1) s``; the thread bits
+    split into lane (the low ``log2(threads_per_warp)``) and warp (the rest),
+    and the value bits map to registers.
+
+    Example (separable QK layout, tile ``[N=128, M=128]``, so flat offset is
+    ``n * 128 + m``)::
+
+        tlx.layout(
+            shape =((32, 4, 2), (32, 2)),   # (thread, value)
+            stride=((128, 4096, 32), (1, 64)),
+        )
+
+    Unlike TLX this takes no ``spec`` argument: passing a swizzled shared-memory
+    layout is not supported here, so use the shared-memory encodings directly.
+    """
+
+    def __init__(self, shape=None, stride=None):
+        super().__init__()
+        assert shape is not None and stride is not None, \
+            "tlx.layout requires shape= and stride= for a register layout"
+        assert len(shape) == 2 and len(stride) == 2, \
+            "layout: shape and stride must each be (thread, value)"
+        self.thread_shape, self.value_shape = shape
+        self.thread_stride, self.value_stride = stride
+
+    def to_ir(self, builder: ir.builder, shape=None, element_type=None):
+        assert shape is not None, \
+            "layout.to_ir requires the consuming tensor shape"
+        tensor_shape = [int(s) for s in shape]
+        warp_size = int(builder.options.warp_size)
+        lane_bits = warp_size.bit_length() - 1  # log2(threads_per_warp)
+
+        value_flat = _modes_to_flat_strides(self.value_shape,
+                                            self.value_stride)
+        thread_flat = _modes_to_flat_strides(self.thread_shape,
+                                             self.thread_stride)
+        lane_flat = thread_flat[:lane_bits]
+        warp_flat = thread_flat[lane_bits:]
+
+        reg_bases = [_flat_to_coord(f, tensor_shape) for f in value_flat]
+        lane_bases = [_flat_to_coord(f, tensor_shape) for f in lane_flat]
+        warp_bases = [_flat_to_coord(f, tensor_shape) for f in warp_flat]
+        # Call the fork's spelling: layout_compat installs
+        # make_linear_encoding_attr onto TLXOpBuilder and maps it to upstream's
+        # get_distributed_linear_layout, the same way it does for the shared
+        # and tensor-memory encodings.
+        return builder.make_linear_encoding_attr(reg_bases, lane_bases,
+                                                 warp_bases, tensor_shape)
+
+    def __repr__(self):
+        return (f"layout<shape=({self.thread_shape}, {self.value_shape}), "
+                f"stride=({self.thread_stride}, {self.value_stride})>")
+
+    def __eq__(self, other):
+        return (isinstance(other, layout)
+                and self.thread_shape == other.thread_shape
+                and self.value_shape == other.value_shape
+                and self.thread_stride == other.thread_stride
+                and self.value_stride == other.value_stride)
+
+    def __hash__(self):
+        return hash((tuple(self.thread_shape), tuple(self.value_shape),
+                     tuple(self.thread_stride), tuple(self.value_stride)))
 
 
 class DummyRegisterLayoutEncoding(layout_encoding):
@@ -355,7 +695,7 @@ class reuse_group:
         return builder.utlx_reuse_group(args)
 
 
-class buffered_tensor(tl.base_value):
+class buffered_tensor(tlx_value):
     """A tensor allocated in a manually managed buffer (SMEM or TMEM)."""
 
     def __init__(
@@ -372,7 +712,24 @@ class buffered_tensor(tl.base_value):
         self.shape = shape
         self.type = buffered_tensor_type(element_ty, shape, num, storage,
                                          layout)
+        # Upstream Triton's builder has no memdesc type constructor
+        # (get_shared_mem_desc_ty / make_*_shared_encoding_attr are TLX-fork
+        # only), so buffered_tensor_type.to_ir() cannot build the type there.
+        # It does not need to: this handle already carries exactly that type.
+        if handle is not None:
+            try:
+                self.type._ir_type = handle.get_type()
+            except AttributeError:
+                pass
         self.dtype = element_ty
+
+    def _set_name(self, builder, name: str) -> None:
+        # Mirrors tl.tensor._set_name. base_value's default raises, and newer
+        # Triton calls this for every @triton.jit argument, so a buffered_tensor
+        # could not be passed across a jit boundary without it.
+        if self.handle is not None:
+            self.handle.set_loc(
+                builder.create_name_loc(name, self.handle.get_loc()))
 
     def _flatten_ir(self, handles) -> None:
         handles.append(self.handle)
@@ -409,6 +766,12 @@ class buffered_tensor_type(tl.block_type):
         shape = "_".join(map(str, self.shape))
         if self.num > 0:
             shape += f"_{self.num}"
+        # Explicit padded/linear layouts are part of the memdesc type, so a
+        # jit helper called on two of them needs two specializations.
+        if isinstance(
+                self.layout,
+            (padded_shared_layout_encoding, shared_linear_layout_encoding)):
+            shape += f"_{self.layout.mangle()}"
         return f"buffered_{elt}S{shape}"
 
     def __str__(self) -> str:
@@ -427,6 +790,11 @@ class buffered_tensor_type(tl.block_type):
                 and self.layout == other.layout)
 
     def to_ir(self, builder):
+        # Prefer the concrete type recorded from the defining value; only fall
+        # back to constructing one (TLX-fork builders only) if unavailable.
+        cached = getattr(self, "_ir_type", None)
+        if cached is not None:
+            return cached
         shape = self.shape
         if self.num >= 1:
             shape = [self.num] + list(shape)
@@ -455,7 +823,7 @@ class buffered_tensor_type(tl.block_type):
         return value, cursor + 1
 
 
-class mbarrier(tl.base_value):
+class mbarrier(tlx_value):
     """An mbarrier allocated in shared memory."""
 
     def __init__(
@@ -489,7 +857,13 @@ class mbarrier_type(buffered_tensor_type):
 
     def to_ir(self, builder):
         if self.num >= 1:
-            shape = [self.num]
+            # Must match createAllocBarriers, which allocates {num, numCTAs}
+            # with numCTAs == 1. Declaring the array rank 1 here made every
+            # memdesc_index that crossed a function boundary go rank 1 -> rank
+            # 1, which upstream rejects with "result rank must be input rank
+            # - 1". A single barrier (num == 0, from local_view) keeps
+            # self.shape and stays rank 1.
+            shape = [self.num, 1]
         else:
             shape = self.shape
         assert self.layout is not None
@@ -506,7 +880,7 @@ class mbarrier_type(buffered_tensor_type):
         return value, cursor + 1
 
 
-class clc_response(tl.base_value):
+class clc_response(tlx_value):
     """A CLC response object."""
 
     def __init__(self, handle, num: int,
@@ -522,11 +896,14 @@ class clc_response(tl.base_value):
 class clc_response_type(buffered_tensor_type):
 
     def __init__(self, num: int, layout: Optional[shared_layout_encoding]):
-        super().__init__(tl.int64, [1], num, storage_kind.smem, layout)
+        # A CLC response is {2} x i64; see createAllocClcResponses.
+        super().__init__(tl.int64, [2], num, storage_kind.smem, layout)
 
     def to_ir(self, builder):
         if self.num >= 1:
-            shape = [self.num]
+            # Match createAllocClcResponses' {num, 2}; see mbarrier_type.to_ir
+            # for why the array must not be declared rank 1.
+            shape = [self.num, 2]
         else:
             shape = self.shape
         assert self.layout is not None
@@ -573,7 +950,7 @@ class reuse_group_ir_type(tl.base_type):
         return f"reuse_group_{self._group_kind.value}"
 
 
-class storage_alias_spec(tl.base_value):
+class storage_alias_spec(tlx_value):
     """A storage alias specification for buffer sharing."""
 
     def __init__(
@@ -672,15 +1049,20 @@ class storage_alias_spec_type(tl.base_type):
         return value, cursor + 1
 
 
-class async_token(tl.base_value):
+class async_token(tlx_value):
     """Tracks and synchronizes asynchronous operations."""
 
     def __init__(self, handle):
         self.handle = handle
         self.type = async_token_type(handle)
 
+    def _set_name(self, builder, name: str) -> None:
+        if self.handle is not None:
+            super()._set_name(builder, name)
+
     def _flatten_ir(self, handles):
-        handles.append(self.handle)
+        if self.handle is not None:
+            handles.append(self.handle)
 
 
 class async_token_type(tl.base_type):
@@ -695,16 +1077,22 @@ class async_token_type(tl.base_type):
         return "async_token_type"
 
     def mangle(self):
-        return "async_token_type"
+        return "async_token_type" if self.value is not None else "async_token_none"
 
+    # A token is one IR value, like any other, so it can cross a jit call or a
+    # loop. Ops that produce none leave a handle-less token that contributes
+    # nothing on either side.
     def _flatten_ir_types(self, builder, out) -> None:
-        return  # No-op: async tokens don't contribute IR types
+        if self.value is not None:
+            out.append(self.value.get_type())
 
     def _unflatten_ir(self, handles, cursor):
+        if self.value is None:
+            return async_token(None), cursor
         return async_token(handles[cursor]), cursor + 1
 
 
-class tensor_descriptor_ptr(tl.base_value):
+class tensor_descriptor_ptr(tlx_value):
 
     def __init__(self, handle, num: int, descriptor_size: int):
         super().__init__()

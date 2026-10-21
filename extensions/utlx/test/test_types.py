@@ -21,6 +21,40 @@ from conftest import tlx
 # ---------------------------------------------------------------------------
 
 
+class TestSwizzledLayout:
+    """tlx.swizzled_layout is Meta's TLX CuTe Swizzle<B, M, S>."""
+
+    def test_resolves_with_shape(self):
+        enc = tlx.swizzled_layout(3, 3, 5, order=[1, 0])._to_encoding([64, 64])
+        assert isinstance(enc, tlx.swizzled_shared_layout_encoding)
+        # vec = 2**3, maxPhase = 2**3, perPhase = 2**(5 + 3) // 64.
+        assert (enc.vectorSize, enc.perPhase, enc.maxPhase) == (8, 4, 8)
+        assert list(enc.order) == [1, 0]
+
+    def test_order_defaults_to_row_major(self):
+        layout = tlx.swizzled_layout(4, 3, 5)
+        assert layout.order is None
+        assert list(layout._to_encoding([32, 256]).order) == [1, 0]
+
+    def test_make_default_is_no_swizzle(self):
+        enc = tlx.swizzled_layout.make_default(2)._to_encoding()
+        assert (enc.vectorSize, enc.perPhase, enc.maxPhase) == (1, 1, 1)
+
+    def test_rejects_per_phase_below_one(self):
+        with pytest.raises(ValueError, match="perPhase < 1"):
+            tlx.swizzled_layout(1, 1, 1, order=[1, 0])._to_encoding([32, 32])
+
+    def test_unwraps_constexpr_args(self):
+        layout = tlx.swizzled_layout(tl.constexpr(2),
+                                     tl.constexpr(2),
+                                     tl.constexpr(3),
+                                     order=[tl.constexpr(1),
+                                            tl.constexpr(0)])
+        assert (layout.bits, layout.base, layout.shift) == (2, 2, 3)
+        assert layout.order == [1, 0]
+        assert layout == tlx.swizzled_layout(2, 2, 3, order=[1, 0])
+
+
 class TestStorageKind:
 
     def test_values(self):
@@ -345,6 +379,38 @@ class TestNvMmaSharedLayoutEncoding:
         permuted = layout.make_permute([1, 0])
         assert permuted.order == (0, 1)
 
+    def test_tile_to_shape(self):
+        atom = tlx.nv_mma_shared_layout_encoding.make_default([64, 32],
+                                                              tl.float16)
+        tiled = atom.tile_to_shape((64, 64))
+        assert isinstance(tiled, tlx.shared_linear_layout_encoding)
+        assert tiled.tile_shape == [64, 64]
+        assert tiled.alignment == 1024
+        assert tiled._nv_mma_atom is atom
+
+    def test_tile_to_shape_compares_by_value(self):
+        # Jit specializations key on constexpr layouts, so two tilings of
+        # equal atoms must be one layout, not two.
+        def tiled():
+            return tlx.nv_mma_shared_layout_encoding.make_default(
+                [64, 32], tl.float16).tile_to_shape((64, 64))
+
+        assert tiled() == tiled()
+        assert hash(tiled()) == hash(tiled())
+        assert tiled().mangle() == tiled().mangle()
+
+    def test_tile_to_shape_make_permute(self):
+        atom = tlx.nv_mma_shared_layout_encoding.make_default([64, 32],
+                                                              tl.float16)
+        permuted = atom.tile_to_shape((64, 128)).make_permute([1, 0])
+        assert permuted.tile_shape == [128, 64]
+        assert permuted._nv_mma_atom.order == (0, 1)
+
+    def test_make_shared_linear(self):
+        atom = tlx.nv_mma_shared_layout_encoding.make_default([64, 32],
+                                                              tl.float16)
+        assert atom.make_shared_linear().tile_shape == [64, 32]
+
 
 class TestTensorMemoryLayoutEncoding:
 
@@ -353,6 +419,25 @@ class TestTensorMemoryLayoutEncoding:
         assert layout.blockM == 128
         assert layout.blockN == 64
         assert layout.colStride == 1
+
+
+class TestLayoutEncodingModule:
+    """Layout classes carry the name Triton admits as a kernel global."""
+
+    def test_layout_encodings_live_under_triton_language(self):
+        encodings = [
+            value for value in vars(tlx).values()
+            if isinstance(value, type) and issubclass(value, (
+                tlx.layout_encoding, tlx.tensor_memory_scales_layout_encoding))
+        ]
+        assert tlx.layout in encodings
+        for cls in encodings:
+            assert cls.__module__ == "triton.language.extra.tlx", cls
+            assert getattr(tlx, cls.__qualname__) is cls
+
+    def test_layout_instance_is_an_admissible_global(self):
+        layout = tlx.layout(shape=((128, 4), (4, )), stride=((4, 0), (1, )))
+        assert layout.__module__.startswith("triton.language")
 
 
 # ---------------------------------------------------------------------------
@@ -394,8 +479,12 @@ class TestAsyncToken:
                           if False else object)  # just check it doesn't crash
 
     def test_mangle(self):
+        # A handle-less token flattens to no IR values, a real one to one, so
+        # jit helpers taking either need distinct specializations.
         token = tlx.async_token(handle=None)
-        assert token.type.mangle() == "async_token_type"
+        assert token.type.mangle() == "async_token_none"
+        assert tlx.async_token(
+            handle=object()).type.mangle() == "async_token_type"
 
 
 if __name__ == "__main__":

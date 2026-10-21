@@ -11,6 +11,7 @@ import triton.language.core as tl
 from triton._C.libtriton import ir
 
 from . import types as tlx
+from ._compat import checked_handle
 from .types import storage_kind
 from .utility import cuda_parse_arch
 
@@ -34,6 +35,11 @@ _DTYPE_TO_BUILDER_METHOD = {
 def _make_type_carrier(builder, dtype):
     """Create a type-carrier scalar constant of the desired element type."""
     builder_method = _DTYPE_TO_BUILDER_METHOD.get(dtype)
+    if builder_method is None and dtype.is_fp8():
+        # The builder has no fp8 constant getters. Only the carrier's element
+        # type is read, so an int8 zero reinterpreted as fp8 serves.
+        return builder.create_bitcast(builder.get_int8(0),
+                                      dtype.to_ir(builder))
     if builder_method is None:
         raise ValueError(f"Unsupported dtype: {dtype}")
 
@@ -57,11 +63,41 @@ def _assert_blackwell_for_tmem(arch):
 
 def _create_tmem_compatible_tensor_layout(builder,
                                           tensor: tlx.buffered_tensor):
-    """Create a DummyRegisterLayout encoding for TMEM-compatible register layout."""
-    return builder.utlx_make_dummy_register_layout(
-        [builder.get_int32(int(s)) for s in tensor.shape] +
-        [_make_type_carrier(builder, tensor.dtype),
-         builder.get_int32(1)])  # tmemCompatible=True
+    """A value whose tensor type carries a TMEM-compatible register layout.
+
+    uTLX used to hand back a DummyRegisterLayout placeholder and let its own
+    PropagateLayout pass resolve it. Upstream never gets that far: the first
+    pass to ask the encoding for a linear layout hits
+    `toLinearLayout: "unknown layout"` and aborts the process, because
+    `#tlx.dummy_register_layout` implements no upstream layout interface. So
+    the concrete layout has to be computed here.
+
+    `compute_tmem_reg_layout` needs the warp count of the code that will run
+    the access, which inside `with tlx.async_tasks(...)` is the enclosing
+    task's, not the kernel's -- see `current_num_warps`.
+    """
+    from triton.experimental.gluon.language import distributed_type
+    from triton.experimental.gluon.language._semantic import (
+        _compute_tmem_reg_layout)
+    from triton.experimental.gluon.language.nvidia.blackwell import (
+        TensorMemoryLayout)
+
+    from .compiler.code_generator import current_num_warps
+
+    shape = [int(s) for s in tensor.shape]
+    if len(shape) != 2:
+        raise NotImplementedError(
+            f"TMEM access needs a 2D tile, got shape {shape}")
+
+    num_warps = current_num_warps(builder)
+    # col_stride=1 matches tensor_memory_layout_encoding.make_default, i.e. the
+    # packed layout uTLX allocates.
+    tmem_layout = TensorMemoryLayout(block=(shape[0], shape[1]), col_stride=1)
+    reg_layout = _compute_tmem_reg_layout(tensor.dtype, shape, shape,
+                                          tmem_layout, num_warps, "32x32b")
+    carrier_ty = distributed_type(tensor.dtype, shape, reg_layout)
+    # Only the type matters; the value is never read.
+    return builder.create_poison(carrier_ty.to_ir(builder))
 
 
 def _get_remote_cta_rank_handle(remote_cta_rank, _semantic):
@@ -125,11 +161,18 @@ def local_alloc(
     # If reuse is a buffered_tensor, use local_alias (share memory with existing buffer)
     if reuse is not None and isinstance(reuse, tlx.buffered_tensor):
         return _local_alloc_with_alias(_semantic, reuse, dtype, full_shape,
-                                       unwrapped_shape, unwrapped_num, storage)
+                                       unwrapped_shape, unwrapped_num, storage,
+                                       tl._unwrap_if_constexpr(layout))
 
     if storage == tlx.storage_kind.tmem:
         return _local_alloc_tmem(_semantic, dtype, full_shape, unwrapped_shape,
                                  unwrapped_num)
+
+    layout = tl._unwrap_if_constexpr(layout)
+    if isinstance(layout, (tlx.padded_shared_layout_encoding,
+                           tlx.shared_linear_layout_encoding)):
+        return _local_alloc_pinned(_semantic, dtype, full_shape,
+                                   unwrapped_shape, unwrapped_num, layout)
 
     type_carrier = _make_type_carrier(_semantic.builder, dtype)
     shape_values = [
@@ -150,6 +193,27 @@ def local_alloc(
 
     return tlx.buffered_tensor(tensor_handle, dtype, unwrapped_shape,
                                unwrapped_num, storage, py_layout)
+
+
+def _local_alloc_pinned(semantic, dtype, full_shape, unwrapped_shape,
+                        unwrapped_num, layout):
+    """Allocate SMEM with an explicit padded/shared-linear encoding.
+
+    Other ``layout=`` values are ignored and the layout pass picks the
+    encoding from the consumers. These two describe a physical image the
+    kernel was written against (and that the AMD async copies are sized for),
+    so the encoding goes on the alloc as given and the layout pass leaves it
+    alone. The encoding may cover only the per-buffer dims; the leading
+    ``num`` dim is the multi-buffering dim upstream's verifier accepts.
+    """
+    builder = semantic.builder
+    mem_desc_ty = builder.get_shared_mem_desc_ty(dtype.to_ir(builder),
+                                                 full_shape,
+                                                 layout.to_ir(builder),
+                                                 full_shape)
+    tensor_handle = builder.create_local_alloc(mem_desc_ty)
+    return tlx.buffered_tensor(tensor_handle, dtype, unwrapped_shape,
+                               unwrapped_num, tlx.storage_kind.smem, layout)
 
 
 def _local_alloc_with_storage_alias(semantic, spec, dtype, full_shape,
@@ -203,13 +267,37 @@ def _local_alloc_tmem(semantic, dtype, full_shape, unwrapped_shape,
                                unwrapped_num, storage_kind.tmem, py_layout)
 
 
-def _local_alloc_with_alias(semantic, reuse_tensor, dtype, full_shape,
-                            unwrapped_shape, unwrapped_num, storage):
-    """Allocate via utlx_local_alias (share memory with existing buffered_tensor)."""
+def _local_alloc_with_alias(semantic,
+                            reuse_tensor,
+                            dtype,
+                            full_shape,
+                            unwrapped_shape,
+                            unwrapped_num,
+                            storage,
+                            layout=None):
+    """Allocate via utlx_local_alias (share memory with existing buffered_tensor).
+
+    The alias takes the encoding of ``reuse_tensor`` unless ``layout`` is a
+    pinned encoding (see :func:`_local_alloc_pinned`). Those are tied to a
+    shape, so the source's would not fit an alias of a different shape.
+    """
     if reuse_tensor.type.storage != storage:
         raise ValueError(
             f"reuse tensor has storage {reuse_tensor.type.storage} but "
             f"allocation requests {storage}")
+    if storage == storage_kind.smem and isinstance(
+            layout, (tlx.padded_shared_layout_encoding,
+                     tlx.shared_linear_layout_encoding)):
+        builder = semantic.builder
+        mem_desc_ty = builder.get_shared_mem_desc_ty(dtype.to_ir(builder),
+                                                     full_shape,
+                                                     layout.to_ir(builder),
+                                                     full_shape)
+        carrier = builder.create_poison(mem_desc_ty)
+        tensor_handle = builder.utlx_local_alias(
+            [reuse_tensor.handle, carrier])
+        return tlx.buffered_tensor(tensor_handle, dtype, unwrapped_shape,
+                                   unwrapped_num, storage, layout)
     type_carrier = _make_type_carrier(semantic.builder, dtype)
     shape_values = [semantic.builder.get_int32(int(dim)) for dim in full_shape]
     is_tmem = storage == storage_kind.tmem
@@ -284,10 +372,32 @@ def remote_view(
         local_allocated_buffer,
         tlx.mbarrier), "remote_view only supports barrier for now"
     assert local_allocated_buffer.type.storage == storage_kind.smem, "remote_view requires local smem as input"
+    # ttng.map_to_remote_buffer is fork-only; upstream has no op for
+    # mapa.shared::cluster and no way to name another CTA's shared memory. The
+    # plugin op therefore cannot build anything and used to leave its result
+    # slot null, which surfaced far away as a null operand on whatever consumed
+    # the "remote" barrier. Refuse here instead, where the reason is legible.
+    #
+    # Naming a peer CTA's memory in general does need a core Triton op. Arriving
+    # at a peer's barrier -- which is all any kernel here uses remote_view for --
+    # does not: ttng.ArriveBarrierOp takes a fromCTA mask of the CTA-ID bits to
+    # preserve, so the arrival lands in CTA (my_cta_id & fromCTA), and fromCTA=0
+    # routes every CTA to CTA 0. Rebuilding barrier_arrive(remote_cta_rank=0) on
+    # create_mbarrier_arrive(..., from_cta=0) is the way to lift the NUM_CTAS=2
+    # restriction; what stops it today is the paired-CTA accumulator convention,
+    # not this op.
+    raise NotImplementedError(
+        "tlx.remote_view needs ttng.map_to_remote_buffer (mapa.shared::cluster),"
+        " which upstream Triton does not have, so uTLX cannot address a peer"
+        " CTA's shared memory and NUM_CTAS=2 kernels do not build. To arrive at"
+        " a peer CTA's barrier, use create_mbarrier_arrive(..., from_cta=) --"
+        " see the comment above this raise.")
     remote_cta_rank_handle = _get_remote_cta_rank_handle(
         remote_cta_rank, _semantic)
-    remote_buf_handle = _semantic.builder.utlx_map_to_remote_buffer(
-        [local_allocated_buffer.handle, remote_cta_rank_handle])
+    remote_buf_handle = checked_handle(
+        _semantic.builder.utlx_map_to_remote_buffer(
+            [local_allocated_buffer.handle, remote_cta_rank_handle]),
+        "remote_view")
     return tlx.mbarrier(remote_buf_handle, 0,
                         local_allocated_buffer.type.layout,
                         storage_kind.smemCluster)
@@ -341,8 +451,14 @@ def subslice(
     subslice_shape = [dim for dim in local_allocated_buffer.type.shape[:-1]
                       ] + [size]
     return tlx.buffered_tensor(
-        _semantic.builder.create_tmem_subslice(local_allocated_buffer.handle,
-                                               offset, size),
+        # utlx_tmem_subslice, not upstream's create_tmem_subslice: the
+        # upstream binding wants a caller-computed result type, and deriving it
+        # in the plugin preserves the source memdesc's encoding and alloc_shape.
+        _semantic.builder.utlx_tmem_subslice([
+            local_allocated_buffer.handle,
+            _semantic.builder.get_int32(int(tl._unwrap_if_constexpr(offset))),
+            _semantic.builder.get_int32(int(tl._unwrap_if_constexpr(size))),
+        ]),
         local_allocated_buffer.type.element_ty,
         subslice_shape,
         local_allocated_buffer.type.num,
@@ -365,8 +481,15 @@ def local_slice(
         assert shape[0] == buffer.type.shape[0]
         return subslice(buffer, offset[1], shape[1], _semantic=_semantic)
     else:
-        slice_handle = _semantic.builder.create_memdesc_subslice(
-            buffer.handle, offset, shape)
+        # See the note in subslice() on why this goes through the plugin op.
+        slice_handle = _semantic.builder.utlx_memdesc_subslice(
+            [buffer.handle] + [
+                _semantic.builder.get_int32(int(tl._unwrap_if_constexpr(o)))
+                for o in offset
+            ] + [
+                _semantic.builder.get_int32(int(tl._unwrap_if_constexpr(s)))
+                for s in shape
+            ])
         return tlx.buffered_tensor(
             slice_handle,
             buffer.type.scalar,
@@ -401,9 +524,21 @@ def local_reinterpret(
     src: tlx.buffered_tensor,
     dtype: tl.dtype,
     shape=None,
+    layout=None,
+    pin=True,
     _semantic=None,
 ) -> tlx.buffered_tensor:
-    """Reinterpret the dtype and shape of a buffered tensor."""
+    """Reinterpret the dtype and shape of a buffered tensor.
+
+    With ``layout`` the view also takes that explicit shared-memory layout, as
+    in fork TLX. ``pin`` is accepted for compatibility: explicit shared layouts
+    are always kept as given here. Without ``layout`` the source layout is
+    preserved.
+    """
+    layout = tl._unwrap_if_constexpr(layout)
+    pin = tl._unwrap_if_constexpr(pin)
+    assert isinstance(
+        pin, bool), (f"pin must be a constexpr bool, got {type(pin).__name__}")
     if shape is None:
         shape = src.type.shape
     else:
@@ -411,11 +546,24 @@ def local_reinterpret(
             src, tlx.buffered_tensor
         ) and src.type.storage == tlx.storage_kind.smem, (
             "TLX local_reinterpret with reshaping only supports SMEM")
+    shape = [int(tl._unwrap_if_constexpr(d)) for d in shape]
 
-    reinterpreted_value_handle = _semantic.builder.create_memdesc_reinterpret(
-        src.handle, dtype.to_ir(_semantic.builder), shape)
-    return tlx.buffered_tensor(reinterpreted_value_handle, dtype, shape,
-                               src.type.num, src.type.storage, src.type.layout)
+    b = _semantic.builder
+    if layout is not None:
+        assert (src.type.storage == tlx.storage_kind.smem
+                and isinstance(layout, tlx.shared_layout_encoding)), (
+                    "TLX local_reinterpret only supports explicit "
+                    "shared-memory layouts")
+        ty = b.get_shared_mem_desc_ty(dtype.to_ir(b), shape, layout.to_ir(b),
+                                      shape)
+        handle = b.create_memdesc_reinterpret(ty, src.handle)
+    else:
+        handle = b.utlx_memdesc_reinterpret(
+            [src.handle, b.get_null_value(dtype.to_ir(b))] +
+            [b.get_int32(d) for d in shape])
+        layout = src.type.layout
+    return tlx.buffered_tensor(handle, dtype, shape, src.type.num,
+                               src.type.storage, layout)
 
 
 @tl.builtin
@@ -466,7 +614,7 @@ def async_load(
             src.handle, result.handle, bulk_size_handle, barrier.handle,
             _semantic.builder.get_int32(1)
         ])  # useBulk=1
-        return tlx.async_token(token)
+        return tlx.async_token(checked_handle(token, "async_load"))
 
     assert bulk_size is None, "bulk_size requires bulk=True"
     assert barrier is None, "barrier requires bulk=True"
@@ -495,7 +643,7 @@ def async_load(
         args.append(other.handle)
     args.append(_semantic.builder.get_int32(0))  # useBulk=0
     token = _semantic.builder.utlx_async_load(args)
-    return tlx.async_token(token)
+    return tlx.async_token(checked_handle(token, "async_load"))
 
 
 @tl.builtin
@@ -527,25 +675,45 @@ def async_load_wait_group(
         t.handle for t in tokens if t is not None and t.handle is not None
     ]
     args = [_semantic.builder.get_int32(pendings)] + handles
-    _semantic.builder.utlx_async_wait_group(args)
-    return tlx.async_token(None)
+    token = _semantic.builder.utlx_async_wait_group(args)
+    return tlx.async_token(checked_handle(token, "async_load_wait_group"))
 
 
 @tl.builtin
 def local_load(
     src: tlx.buffered_tensor,
     token: Optional[tlx.async_token] = None,
+    layout=None,
+    relaxed=False,
+    rematerialize_coordinates=False,
+    rematerialize_coordinates_group=None,
     _semantic=None,
 ) -> tl.tensor:
-    """Load from SMEM/TMEM buffer into a register tensor."""
+    """Load from SMEM/TMEM buffer into a register tensor.
+
+    ``layout`` optionally names the register layout the result should land in
+    (a carrier from e.g. ``amd_mfma_layout`` / ``dot_operand_layout``), matching
+    the ``layout=`` that ``local_alloc`` already accepts.
+
+    ``relaxed`` and ``rematerialize_coordinates(_group)`` are Meta-fork AMD
+    lowering hints (skip the redundant async-copy dependency/wait count after
+    an explicit wait; recompute LDS addresses at the load). They are accepted
+    and ignored: the load keeps upstream's conservative wait tracking and
+    addressing, which yields the same values.
+    """
     block_type = tl.block_type(src.type.element_ty, src.type.shape)
     storage = src.type.storage
     if storage == tlx.storage_kind.tmem:
         _assert_blackwell_for_tmem(_semantic.builder.options.arch)
         tmem_layout = _create_tmem_compatible_tensor_layout(
             _semantic.builder, src)
-        load_handle = _semantic.builder.create_tmem_load(
-            src.handle, tmem_layout, token.handle if token else None)
+        # utlx_tmem_load, not upstream's create_tmem_load: the upstream
+        # binding wants a concrete distributed result type, while uTLX defers
+        # the register layout to PropagateLayout via the carrier below.
+        load_args = [src.handle, tmem_layout]
+        if token is not None and token.handle is not None:
+            load_args.append(token.handle)
+        load_handle = _semantic.builder.utlx_tmem_load(load_args)
         output = _semantic.builder.utlx_release_layout([load_handle])
         return tl.tensor(output, block_type)
     else:
@@ -553,7 +721,11 @@ def local_load(
         if token is not None and token.handle is not None:
             args.append(token.handle)
         output = _semantic.builder.utlx_local_load(args)
-        return tl.tensor(output, block_type)
+        result = tl.tensor(output, block_type)
+        if layout is not None:
+            from .layout_ops import _require
+            result = _require(_semantic, result, layout)
+        return result
 
 
 @tl.builtin
@@ -570,9 +742,10 @@ def local_store(
             _semantic.builder, dst)
         src_handle = _semantic.builder.utlx_require_with_layout_carrier(
             [src.handle, tmem_layout])
-        return tl.tensor(
-            _semantic.builder.create_tmem_store(dst.handle, src_handle),
-            tl.void)
+        # See the note in local_load; the plugin op also supplies the
+        # predicate operand that upstream's TMEMStoreOp requires.
+        _semantic.builder.utlx_tmem_store([dst.handle, src_handle])
+        return tl.tensor(src_handle, tl.void)
 
     _semantic.builder.utlx_local_store([dst.handle, src.handle])
     return tl.tensor(src.handle, tl.void)
@@ -650,10 +823,11 @@ def allocate_tensor_descriptor(
     nbytes = descriptor_size * unwrapped_num
     alignment = 128
 
-    tensor_handle = _semantic.builder.utlx_global_scratch_alloc([
-        _semantic.builder.get_int32(nbytes),
-        _semantic.builder.get_int32(alignment)
-    ])
+    tensor_handle = checked_handle(
+        _semantic.builder.utlx_global_scratch_alloc([
+            _semantic.builder.get_int32(nbytes),
+            _semantic.builder.get_int32(alignment)
+        ]), "allocate_tensor_descriptor")
     return tlx.tensor_descriptor_ptr(tensor_handle, unwrapped_num,
                                      descriptor_size)
 
@@ -757,9 +931,15 @@ def async_descriptor_load(
     cache_modifier: str = "",
     eviction_policy: str = "",
     multicast_targets: Optional[list] = None,
+    two_ctas=False,
     _semantic=None,
 ) -> None:
-    """Asynchronously load a tensor tile from global memory via TMA."""
+    """Asynchronously load a tensor tile from global memory via TMA.
+
+    `two_ctas` requests the 2-CTA multicast form. Upstream spells that as the
+    copy's `multicast` flag and ands it with whether the destination actually
+    has a CGA broadcast, so it degrades to a plain copy on one CTA.
+    """
     from .mma_ops import require_nv_mma_shared_layout
     if multicast_targets is None:
         multicast_targets = []
@@ -771,12 +951,17 @@ def async_descriptor_load(
     assert len(offsets) == ndim
     result_handle = require_nv_mma_shared_layout(result, True,
                                                  _semantic.builder)
+    # An explicit NVMMA view (e.g. narrower-swizzled atoms) needs the
+    # descriptor to carry its layout for the copy to verify.
+    _semantic.builder.utlx_match_tensor_desc_layout(
+        [desc.handle, result_handle])
     offsets = _semantic._convert_to_ir_values(offsets, require_i64=False)
     if pred is None:
         pred_handle = _semantic.builder.get_int1(True)
     else:
         pred_handle = pred.handle
-    multicast = len(multicast_targets) > 0
+    multicast = (len(multicast_targets) > 0
+                 or bool(tl._unwrap_if_constexpr(two_ctas)))
     # Use gluon: create_async_tma_copy_global_to_local(desc, coord, barrier, result, pred, multicast, offsets)
     _semantic.builder.create_async_tma_copy_global_to_local(
         desc.handle, offsets, barrier.handle, result_handle, pred_handle,
@@ -809,6 +994,23 @@ def async_descriptor_prefetch_tensor(
 
 
 @tl.builtin
+def prefetch(pointer, level="L2", mask=None, tensormap=False, _semantic=None):
+    """Prefetch hint for a pointer tensor, or for a TMA descriptor object.
+
+    The fork lowers this to ``ttng.prefetch`` / ``ttng.prefetch_tensormap``,
+    neither of which stock Triton has. A prefetch only warms a cache, so here
+    it checks its arguments as the fork does and emits nothing: kernels that
+    use it compile and compute the same result, without the hint.
+    """
+    level = tl._unwrap_if_constexpr(level)
+    if tl._unwrap_if_constexpr(tensormap):
+        assert isinstance(pointer, tl.tensor_descriptor_base), \
+            "prefetch(tensormap=True) takes a tensor descriptor"
+        return
+    assert level in ("L1", "L2"), f"level must be 'L1' or 'L2', got '{level}'"
+
+
+@tl.builtin
 def async_descriptor_store(
     desc: tl.tensor_descriptor_base,
     source: tlx.buffered_tensor,
@@ -831,6 +1033,8 @@ def async_descriptor_store(
     assert len(offsets) == ndim
     source_handle = require_nv_mma_shared_layout(source, True,
                                                  _semantic.builder)
+    _semantic.builder.utlx_match_tensor_desc_layout(
+        [desc.handle, source_handle])
     offsets = _semantic._convert_to_ir_values(offsets, require_i64=False)
 
     if store_reduce == "":
@@ -855,12 +1059,19 @@ def async_descriptor_store(
 @tl.builtin
 def async_descriptor_store_wait(
     pendings: tl.constexpr,
+    read_only: tl.constexpr = True,
     _semantic=None,
 ) -> None:
-    """Wait for completion of prior asynchronous TMA store operations."""
+    """Wait for completion of prior asynchronous TMA store operations.
+
+    ``read_only`` waits only until the pending stores have released their
+    shared-memory sources, which is what this op did before Triton made the
+    stronger HBM-visibility wait available; it stays the default here too.
+    """
     pendings = tl._unwrap_if_constexpr(pendings)
-    # Use gluon: create_async_tma_store_wait(pendings)
-    _semantic.builder.create_async_tma_store_wait(pendings)
+    read_only = tl._unwrap_if_constexpr(read_only)
+    # Use gluon: create_async_tma_store_wait(pendings, read_only)
+    _semantic.builder.create_async_tma_store_wait(pendings, read_only)
 
 
 # Monkey-patch __getitem__ for indexing support

@@ -39,7 +39,7 @@ Extensions live in subdirectories, each built as a separate Triton wheel:
 - **[`dialect/`](./dialect/)**: For adding MLIR dialects to Triton.
 
 - **[`pass/`](./pass/)**: For adding MLIR passes to Triton (e.g.,
-  [`arithmetic-intensity`][arithmetic-intensity]).
+  \[`intensity`\][intensity]).
 
 - **[`extensions/`](./extensions/)**: For extensions that bundle dialects,
   passes, and language bindings together (e.g., [`utlx`][utlx]).
@@ -49,7 +49,7 @@ Extensions live in subdirectories, each built as a separate Triton wheel:
 
 ## Prerequisites
 
-- C++ compiler with C++17 support
+- C++ compiler with C++20 support
 - CMake
 - GitHub CLI ([`gh`]), for downloading pre-built dependencies (optional)
 - Ninja
@@ -136,7 +136,6 @@ import triton-<extension>
 ...
 ```
 
-[arithmetic-intensity]: ./pass/ArithmeticIntensity/
 [build_llvm]: https://github.com/triton-lang/triton/blob/main/scripts/build-llvm-project.sh
 [download_llvm]: ./ci/download_llvm.py
 [download_triton]: ./ci/download_triton_wheel.py

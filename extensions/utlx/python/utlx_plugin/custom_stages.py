@@ -5,6 +5,7 @@ Hooks into triton's compilation pipeline to inject uTLX passes.
 
 from triton._C.libtriton import ir, passes, amd
 from triton import knobs
+from triton.backends.compiler import Language
 import hashlib
 import pathlib
 
@@ -26,6 +27,38 @@ def is_in_thread_transpose_enabled(arch):
     ) if knobs.amd.use_in_thread_transpose is None else knobs.amd.use_in_thread_transpose
 
 
+# TTIR ops only TLX introduces. Fork TLX's tlx-fixup tags modules containing
+# them with `triton.skip_generic_pipeline`, and its software pipeliners return
+# early on that tag.
+_TLX_TTIR_OPS = frozenset({
+    "ttg.local_load",
+    "ttg.local_store",
+    "ttg.warp_specialize",
+    "ttg.warp_yield",
+    "ttg.warp_return",
+    "ttng.async_tma_copy_global_to_local",
+    "ttng.async_tma_copy_local_to_global",
+    "ttng.tmem_alloc",
+    "ttng.tmem_load",
+    "ttng.tmem_store",
+    "ttng.tc_gen5_mma",
+})
+
+
+def is_tlx_module(mod):
+    """Whether `mod` (TTIR) is a TLX kernel, by the same test as fork TLX."""
+    found = False
+
+    def visit(op):
+        nonlocal found
+        name = op.get_name()
+        if name.startswith("tlx.") or name in _TLX_TTIR_OPS:
+            found = True
+
+    mod.walk(visit)
+    return found
+
+
 _cached_key = None
 _cached_hash = None
 
@@ -44,12 +77,66 @@ def get_hash():
     return _cached_hash
 
 
+def lower_warp_barrier_arrives_after_to_llvmir():
+    """Run utlx_lower_warp_barrier_arrive right after NVIDIA's add_to_llvmir.
+
+    tlx.warp_barrier_arrive (fbtriton's perThread ttng.arrive_barrier) can
+    only be lowered once its barrier operand is a shared-memory pointer, i.e.
+    after TritonGPU-to-LLVM conversion, and make_llir runs that conversion and
+    everything after it in one pass manager. Wrap the pass adder so the
+    lowering lands directly behind the conversion. The wrapper stays installed
+    for the life of the process, so concurrent compiles never miss it; the
+    pass does nothing in modules without warp barrier arrives.
+    """
+    from triton._C.libtriton import nvidia
+
+    ttgpuir = nvidia.passes.ttgpuir
+    add_to_llvmir = ttgpuir.add_to_llvmir
+    if getattr(add_to_llvmir, "_utlx", False):
+        return
+
+    def add_to_llvmir_then_lower_warp_barrier_arrives(pm, *args, **kwargs):
+        add_to_llvmir(pm, *args, **kwargs)
+        passes.plugin.utlx_lower_warp_barrier_arrive(pm, [])
+
+    add_to_llvmir_then_lower_warp_barrier_arrives._utlx = True
+    ttgpuir.add_to_llvmir = add_to_llvmir_then_lower_warp_barrier_arrives
+
+
+def optimize_descriptor_encoding_for_tma_copies():
+    """Run utlx_optimize_descriptor_encoding in place of NVIDIA's pass.
+
+    Upstream assigns descriptor layouts from tt.descriptor_load/store only, so
+    a descriptor that tlx.async_descriptor_load/store copies through an
+    explicit NVMMA view would be reset to the default layout and the copy
+    would no longer verify. The uTLX pass runs upstream's assignment and then
+    keeps the layout those copies need. Like the wrapper above, it stays
+    installed for the life of the process.
+    """
+    from triton._C.libtriton import nvidia
+
+    ttnvgpuir = nvidia.passes.ttnvgpuir
+    if getattr(ttnvgpuir.add_optimize_descriptor_encoding, "_utlx", False):
+        return
+
+    def add_optimize_descriptor_encoding(pm, *args, **kwargs):
+        passes.plugin.utlx_optimize_descriptor_encoding(pm, [])
+
+    add_optimize_descriptor_encoding._utlx = True
+    ttnvgpuir.add_optimize_descriptor_encoding = add_optimize_descriptor_encoding
+
+
 def inspect_stages_hook(self=None,
                         stages=None,
                         options=None,
                         language=None,
                         capability=None):
     if all(arg is None for arg in (stages, options, language, capability)):
+        return get_key(), get_hash()
+
+    # Gluon kernels have their own ttgir stage (gluon_to_ttgir) and are already
+    # in TTGIR; the uTLX TTIR->TTGIR conversion marks their amdg ops illegal.
+    if language is not None and language != Language.TRITON:
         return get_key(), get_hash()
 
     backend_name = getattr(self, 'name', '') if self else ''
@@ -60,6 +147,13 @@ def inspect_stages_hook(self=None,
         warp_size = getattr(options, 'warp_size', 64)
 
         def make_ttgir_wrapper(mod, metadata):
+            # TLX kernels place their own async copies, waits and stage
+            # borders. Stock Pipeline lowers and merges waits regardless, e.g.
+            # once a one-trip main loop folds away it merges the prologue and
+            # loop waits; WarpPipeline then pulls a buffer's local_loads into
+            # a stage that races the other warp group's copy into it.
+            hand_pipelined = is_tlx_module(mod)
+
             # Phase 1: Plugin ConvertTritonToTritonGPU
             pm = ir.pass_manager(mod.context)
             pm.enable_debug()
@@ -77,6 +171,10 @@ def inspect_stages_hook(self=None,
             pm.enable_debug()
             emuTF32 = False
             passes.ttgpuir.add_coalesce(pm)
+            # uTLX: gfx942/gfx950 vector loads need no base alignment; let
+            # Coalesce's load layouts use the full proven contiguity.
+            passes.plugin.utlx_widen_unaligned_loads(pm, [])
+            passes.plugin.utlx_keep_load_layout(pm, [])
             passes.ttgpuir.add_f32_dot_tc(pm, emuTF32)
             passes.ttgpuir.add_remove_layout_conversions(pm)
             passes.ttgpuir.add_optimize_thread_locality(pm)
@@ -85,8 +183,21 @@ def inspect_stages_hook(self=None,
                 pm, options.arch, options.matrix_instr_nonkdim, options.kpack)
             # uTLX: fix MemDesc encodings to match DotOp operand requirements
             passes.plugin.utlx_insert_and_propagate_layout(pm, [])
+            # uTLX: lower tlx.require_layout / tlx.release_layout to
+            # ttg.convert_layout. utlx_insert_and_propagate_layout only rewrites
+            # MemDesc shared encodings, so without this any *register* layout
+            # request (amd_mfma_layout, dot_operand_layout, ...) would survive to
+            # the backend as an unhandled tlx op.
+            passes.plugin.utlx_propagate_layout(pm, [])
 
             passes.ttgpuir.add_remove_layout_conversions(pm)
+            # uTLX: stock RemoveLayoutConversions never moves a dot-operand
+            # convert backwards, so a hand-pipelined loop-carried local_load
+            # would be staged through extra shared memory per dot.
+            passes.plugin.utlx_dot_operand_local_load(pm, [])
+            # Likewise for index arithmetic, e.g. buffer_load offsets laid
+            # out so the loaded tile lands in MFMA registers.
+            passes.plugin.utlx_remat_dot_operand_slices(pm, [])
             amd.passes.ttgpuir.add_optimize_epilogue(pm)
             amd.passes.ttgpuir.add_optimize_dot_operands(pm, options.arch)
             amd.passes.ttgpuir.add_hoist_layout_conversions(pm)
@@ -101,16 +212,18 @@ def inspect_stages_hook(self=None,
             use_block_pingpong = is_pingpong_schedule_enabled(
                 options.arch, use_async_copy)
 
-            amd.passes.ttgpuir.add_schedule_loops(pm, options.num_stages)
-            amd.passes.ttgpuir.add_pipeline(pm, use_async_copy,
-                                            use_block_pingpong)
+            amd.passes.ttgpuir.add_optimize_descriptor_encoding(pm)
+            if not hand_pipelined:
+                amd.passes.ttgpuir.add_schedule_loops(pm, options.num_stages)
+                amd.passes.ttgpuir.add_pipeline(pm, use_async_copy,
+                                                use_block_pingpong)
             if use_async_copy:
                 amd.passes.ttgpuir.add_coalesce_async_copy(pm, options.arch)
+                # uTLX: copies into a pinned shared layout that transposes the
+                # global data cannot be direct-to-LDS; load them via registers.
+                passes.plugin.utlx_fallback_async_copy(pm, [])
             amd.passes.ttgpuir.add_convert_to_tensor_ops(pm)
             passes.common.add_canonicalizer(pm)
-            if options.schedule_hint.lower() != "none":
-                for hint in options.schedule_hint.split(","):
-                    amd.passes.ttgpuir.insert_instruction_sched_hints(pm, hint)
             passes.ttgpuir.add_remove_layout_conversions(pm)
             passes.ttgpuir.add_reduce_data_duplication(pm)
             if is_in_thread_transpose_enabled(options.arch):
@@ -129,6 +242,8 @@ def inspect_stages_hook(self=None,
                     knobs.amd.use_buffer_atomics,
                     knobs.amd.buffer_ops_analyze_small_tensor_range,
                 )
+                # uTLX: likewise for the vector width buffer_loads record.
+                passes.plugin.utlx_widen_unaligned_buffer_loads(pm, [])
                 amd.passes.ttgpuir.add_optimize_buffer_op_ptr(pm)
 
             amd.passes.ttgpuir.add_fold_true_cmpi(pm)
@@ -136,6 +251,10 @@ def inspect_stages_hook(self=None,
             passes.common.add_canonicalizer(pm)
             passes.common.add_cse(pm)
             passes.common.add_symbol_dce(pm)
+            # Consume tlx.warp_pipeline_stage border markers. Gluon runs this in
+            # gluon_to_ttgir; make_llir already runs the conversion. Last, so
+            # the cleanup passes above cannot strip the markers first.
+            amd.passes.ttgpuir.add_warp_pipeline(pm)
             if getattr(options, 'instrumentation_mode', 'none') == "fpsan":
                 amd.passes.ttgpuir.add_fp_sanitizer(pm)
                 passes.ttgpuir.add_fp_sanitizer(pm)
@@ -145,6 +264,21 @@ def inspect_stages_hook(self=None,
 
         stages["ttgir"] = lambda src, metadata: make_ttgir_wrapper(
             src, metadata)
+
+        # As on NVIDIA: make_llir's shared-memory alias analysis (via
+        # ConvertWarpPipeline and AllocateAMDGPUSharedMemory) rejects
+        # tlx.local_alias and StorageAliasLocalAllocOp.
+        original_amd_llir = stages["llir"]
+
+        def make_amd_llir_wrapper(mod, metadata):
+            pm = ir.pass_manager(mod.context)
+            pm.enable_debug()
+            passes.plugin.utlx_storage_alias_lowering(pm, [])
+            passes.plugin.utlx_rewrite_local_alias(pm, [])
+            pm.run(mod, 'utlx_storage_alias')
+            return original_amd_llir(mod, metadata)
+
+        stages["llir"] = make_amd_llir_wrapper
     else:
         # NVIDIA/CUDA: replace make_ttir to inject plugin pass after TTIR
         def make_ttir_wrapper(mod, metadata, opt, cap):
@@ -161,6 +295,9 @@ def inspect_stages_hook(self=None,
 
         stages["ttir"] = lambda src, metadata: make_ttir_wrapper(
             src, metadata, options, capability)
+
+        lower_warp_barrier_arrives_after_to_llvmir()
+        optimize_descriptor_encoding_for_tma_copies()
 
         # Wrap the llir stage to run storage alias lowering before
         # allocate-shared-memory-nv, which invokes the alias analysis

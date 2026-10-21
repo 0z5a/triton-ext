@@ -8,9 +8,12 @@
 #include "ops/NewOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/OperationSupport.h"
+#include "mlir/IR/PatternMatch.h"
+#include "passes/Passes.h"
 #include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -34,8 +37,14 @@ createRuntimeOp(mlir::OpBuilder &builder, mlir::Location loc,
   auto *ctx = builder.getContext();
   auto registeredOp = mlir::RegisteredOperationName::lookup(opName, ctx);
   if (!registeredOp) {
-    llvm::errs() << "utlx: op '" << opName
-                 << "' not registered in this Triton build.\n";
+    // Report against the kernel line rather than to bare stderr, so the note
+    // names the statement that asked for the op. The plugin is built
+    // -fno-exceptions and there is no failure channel back through the op
+    // table, so this cannot stop codegen on its own: ops that return a value
+    // leave their result slot null, which `_compat.checked_handle` turns into
+    // a Python error at the call site.
+    mlir::emitError(loc) << "uTLX: '" << opName
+                         << "' is not registered in this Triton build";
     return nullptr;
   }
   mlir::OperationState state(loc, *registeredOp);
@@ -93,10 +102,11 @@ void utlx::createAsyncStore(TritonOpBuilder &self,
 }
 
 /// utlx_fence(scope_str_as_i32_constant)
-/// scope is passed as an i32 constant: 0="gpu", 1="sys"
+/// operands[0] = result slot (unused, void op)
+/// operands[1] = scope, as an i32 constant: 0="gpu", 1="sys"
 void utlx::createFence(TritonOpBuilder &self,
                        std::vector<mlir::Value> &operands) {
-  if (operands.size() < 1)
+  if (operands.size() < 2)
     return;
   auto &builder = self.getBuilder();
   auto loc = self.getLastLoc();
@@ -104,7 +114,7 @@ void utlx::createFence(TritonOpBuilder &self,
   // Decode scope from i32 constant
   llvm::StringRef scope = "gpu";
   if (auto constOp = mlir::dyn_cast_or_null<mlir::arith::ConstantIntOp>(
-          operands[0].getDefiningOp())) {
+          operands[1].getDefiningOp())) {
     if (constOp.value() == 1)
       scope = "sys";
   }
@@ -205,22 +215,34 @@ void utlx::createAsyncTMAPrefetch(TritonOpBuilder &self,
                   "ttng.async_tma_prefetch", {}, allOperands);
 }
 
+/// utlx_match_tensor_desc_layout(desc, sharedView)
+/// Give a kernel-argument descriptor the NVMMA layout of the shared view a
+/// TMA copy is about to go through, so the copy verifies against it; see
+/// utlx::matchTensorDescToSharedLayout.
+void utlx::createMatchTensorDescLayout(TritonOpBuilder &self,
+                                       std::vector<mlir::Value> &operands) {
+  if (operands.size() < 3)
+    return;
+  auto viewType = mlir::dyn_cast<ttg::MemDescType>(operands[2].getType());
+  if (!viewType)
+    return;
+  utlx::matchTensorDescToSharedLayout(operands[1], viewType.getEncoding());
+}
+
 /// utlx_named_barrier_arrive(bar, numThreads)
 void utlx::createNamedBarrierArrive(TritonOpBuilder &self,
                                     std::vector<mlir::Value> &operands) {
-  if (operands.size() < 2)
+  if (operands.size() < 3)
     return;
-  createRuntimeOp(self.getBuilder(), self.getLastLoc(),
-                  "ttng.named_barrier_arrive", {}, {operands[0], operands[1]});
+  self.create<tlx::NamedBarrierArriveOp>(operands[1], operands[2]);
 }
 
 /// utlx_named_barrier_wait(bar, numThreads)
 void utlx::createNamedBarrierWait(TritonOpBuilder &self,
                                   std::vector<mlir::Value> &operands) {
-  if (operands.size() < 2)
+  if (operands.size() < 3)
     return;
-  createRuntimeOp(self.getBuilder(), self.getLastLoc(),
-                  "ttng.named_barrier_wait", {}, {operands[0], operands[1]});
+  self.create<tlx::NamedBarrierWaitOp>(operands[1], operands[2]);
 }
 
 // ---------------------------------------------------------------------------
@@ -371,6 +393,24 @@ void utlx::createRequireNvMmaSharedLayout(TritonOpBuilder &self,
   auto *context = self.getBuilder().getContext();
   auto cgaLayout = ttg::CGAEncodingAttr::get1CTALayout(context, rank);
 
+  // A view that already carries an NVMMA encoding, e.g. one given explicitly
+  // to tlx.local_reinterpret, describes how the bytes really sit in shared
+  // memory, and the MMA reads any swizzle width. Nothing runs after this on
+  // NVIDIA that could retag the view to the default encoding, so a
+  // require_layout to it would survive to LLVM. Keep the view as it is.
+  bool transposed = rank > 1 && order[0] == 0;
+  if (auto srcEnc =
+          mlir::dyn_cast<ttg::NVMMASharedEncodingAttr>(srcType.getEncoding());
+      srcEnc &&
+      srcEnc.getElementBitWidth() ==
+          srcType.getElementType().getIntOrFloatBitWidth() &&
+      srcEnc.getFp4Padded() == fp4Padded &&
+      srcEnc.getTransposed() == transposed &&
+      (srcEnc.getSwizzlingByteWidth() != 0) == swizzled) {
+    operands[0] = src;
+    return;
+  }
+
   mlir::Attribute encoding;
   if (swizzled) {
     encoding = ttg::NVMMASharedEncodingAttr::get(
@@ -481,12 +521,56 @@ void utlx::createRequireDotOperandLayout(TritonOpBuilder &self,
   if (!opndType)
     return;
 
-  auto encoding = ttg::DotOperandEncodingAttr::get(context, opIdx, parentEnc,
-                                                   opndType.getElementType());
+  // Optional trailing kWidth operand. AMD MFMA dot operands need it stated
+  // explicitly; the element-type overload only infers it for NVIDIA MMA.
+  mlir::Attribute encoding;
+  std::optional<int64_t> kWidth;
+  if (operands.size() >= 5)
+    kWidth = extractConstInt(operands[4]);
+  if (kWidth && *kWidth > 0)
+    encoding = ttg::DotOperandEncodingAttr::get(context, opIdx, parentEnc,
+                                                static_cast<unsigned>(*kWidth));
+  else
+    encoding = ttg::DotOperandEncodingAttr::get(context, opIdx, parentEnc,
+                                                opndType.getElementType());
 
   auto newType = mlir::RankedTensorType::get(
       opndType.getShape(), opndType.getElementType(), encoding);
   operands[0] = self.create<tlx::RequireLayoutOp>(newType, opnd);
+}
+
+/// utlx_make_slice_layout(result_slot, parent_carrier, dim)
+///
+/// Builds a SliceEncodingAttr over the parent carrier's encoding and returns a
+/// new carrier holding it. Shape is the parent's with `dim` dropped.
+void utlx::createMakeSliceLayout(TritonOpBuilder &self,
+                                 std::vector<mlir::Value> &operands) {
+  if (operands.size() < 3)
+    return;
+
+  auto parentTy = mlir::dyn_cast<mlir::RankedTensorType>(operands[1].getType());
+  auto dimVal = extractConstInt(operands[2]);
+  if (!parentTy || !parentTy.getEncoding() || !dimVal)
+    return;
+  unsigned dim = static_cast<unsigned>(*dimVal);
+  if (dim >= parentTy.getRank())
+    return;
+
+  auto *context = self.getBuilder().getContext();
+  auto encoding = ttg::SliceEncodingAttr::get(
+      context, dim,
+      mlir::cast<ttg::DistributedEncodingTrait>(parentTy.getEncoding()));
+
+  llvm::SmallVector<int64_t> shape(parentTy.getShape());
+  shape.erase(shape.begin() + dim);
+  auto elemTy = parentTy.getElementType();
+
+  auto tensorType = mlir::RankedTensorType::get(shape, elemTy, encoding);
+  auto nullVal = self.getBuilder().create<mlir::arith::ConstantOp>(
+      self.getLastLoc(),
+      mlir::DenseElementsAttr::get(mlir::RankedTensorType::get(shape, elemTy),
+                                   self.getBuilder().getZeroAttr(elemTy)));
+  operands[0] = self.create<tlx::RequireLayoutOp>(tensorType, nullVal);
 }
 
 /// utlx_require_tensor_memory_layout(result_slot, src, blockM, blockN,
@@ -563,6 +647,29 @@ void utlx::createClusterCtaRank(TritonOpBuilder &self,
 // Memory ops
 // ---------------------------------------------------------------------------
 
+// Triton main gives AsyncCopyGlobalToLocalOp a cachePolicy attr and isVolatile
+// flag; release/3.8 instead has cache/evict enums with defaults. The int
+// overload is preferred and drops out via SFINAE when the main signature is
+// missing.
+template <typename OpT>
+static auto createAsyncCopyGlobalToLocal(int, mlir::OpBuilder &builder,
+                                         mlir::Location loc, mlir::Type token,
+                                         mlir::Value src, mlir::Value result,
+                                         mlir::Value mask, mlir::Value other)
+    -> decltype(OpT::create(builder, loc, token, src, result, mask, other,
+                            mlir::Attribute(), false)) {
+  return OpT::create(builder, loc, token, src, result, mask, other,
+                     /*cachePolicy=*/mlir::Attribute(), /*isVolatile=*/false);
+}
+
+template <typename OpT>
+static OpT createAsyncCopyGlobalToLocal(long, mlir::OpBuilder &builder,
+                                        mlir::Location loc, mlir::Type token,
+                                        mlir::Value src, mlir::Value result,
+                                        mlir::Value mask, mlir::Value other) {
+  return OpT::create(builder, loc, token, src, result, mask, other);
+}
+
 /// utlx_async_load(result_slot, src, result_memdesc, [mask, other,]
 /// useBulk_flag,
 ///                  [bulk_size, barrier])
@@ -572,45 +679,38 @@ void utlx::createAsyncLoad(TritonOpBuilder &self,
                            std::vector<mlir::Value> &operands) {
   if (operands.size() < 4)
     return;
-  // The op is "ttg.async_copy_global_to_local"
-  // For now, use runtime op creation since the signature may vary
+
   mlir::Value src = operands[1];
   mlir::Value result = operands[2];
 
-  // Find the useBulk flag - it's always the last or second-to-last group
-  // For bulk: [src, result, bulk_size, barrier, useBulk=1]
-  // For non-bulk: [src, result, (mask)?, (other)?, useBulk=0]
   auto useBulkVal = extractConstInt(operands.back());
   if (!useBulkVal)
     return;
   bool useBulk = *useBulkVal != 0;
 
-  if (useBulk) {
-    // operands: [result_slot, src, result, bulk_size, barrier, useBulk=1]
-    if (operands.size() < 6)
-      return;
-    // Bulk async load is effectively a barrier-based TMA copy
-    // Use AsyncCopyGlobalToLocalOp with bulk parameters
-    // For now, create as runtime op since bulk variant may differ
-    llvm::SmallVector<mlir::Value> opOperands = {src, result};
-    auto *op = createRuntimeOp(
-        self.getBuilder(), self.getLastLoc(), "ttg.async_copy_global_to_local",
-        {self.getBuilder().getType<ttg::AsyncTokenType>()}, opOperands);
-    if (op && op->getNumResults() > 0)
-      operands[0] = op->getResult(0);
-  } else {
-    // Non-bulk: operands[1]=src, operands[2]=result, then optional mask/other,
-    // then useBulk=0
-    llvm::SmallVector<mlir::Value> opOperands = {src, result};
-    // Add mask and other if present (operands between result and useBulk flag)
-    for (size_t i = 3; i < operands.size() - 1; ++i)
-      opOperands.push_back(operands[i]);
-    auto *op = createRuntimeOp(
-        self.getBuilder(), self.getLastLoc(), "ttg.async_copy_global_to_local",
-        {self.getBuilder().getType<ttg::AsyncTokenType>()}, opOperands);
-    if (op && op->getNumResults() > 0)
-      operands[0] = op->getResult(0);
+  // Optional mask/other sit between `result` and the trailing useBulk flag.
+  // (Bulk carries bulk_size/barrier there instead, which this op has no slots
+  // for, so they are ignored as before.)
+  mlir::Value mask, other;
+  if (!useBulk) {
+    if (operands.size() > 4)
+      mask = operands[3];
+    if (operands.size() > 5)
+      other = operands[4];
   }
+
+  // Use the typed builder: the generic OperationState path does not populate
+  // operandSegmentSizes, so the op fails to verify with
+  // "operand count (N) does not match the total size (0) specified in
+  // attribute 'operandSegmentSizes'".
+  auto token = self.getBuilder().getType<ttg::AsyncTokenType>();
+  auto op = createAsyncCopyGlobalToLocal<ttg::AsyncCopyGlobalToLocalOp>(
+      0, self.getBuilder(), self.getLastLoc(), token, src, result, mask, other);
+  // NB: op->getResult(0), not op.getResult(). This op has an *operand* named
+  // `result` (the destination memdesc), so the generated getResult() accessor
+  // returns that operand and shadows Operation::getResult() -- which silently
+  // handed the memdesc back to async_load's caller instead of the token.
+  operands[0] = op->getResult(0);
 }
 
 /// utlx_global_scratch_alloc(result_slot, nbytes, alignment) -> ptr
@@ -625,8 +725,16 @@ void utlx::createGlobalScratchAlloc(TritonOpBuilder &self,
     return;
 
   auto *context = self.getBuilder().getContext();
+  // Address space 1 == global. Triton main replaced the plain-int overload of
+  // PointerType::get with the PtrAddrSpace enum, while release/3.8 still takes
+  // an int (UTLX_TRITON_INT_ADDR_SPACE is set by CMake in that case).
+#ifdef UTLX_TRITON_INT_ADDR_SPACE
   auto ptrType = mlir::triton::PointerType::get(self.getBuilder().getI8Type(),
                                                 /*addressSpace=*/1);
+#else
+  auto ptrType = mlir::triton::PointerType::get(
+      self.getBuilder().getI8Type(), mlir::triton::PtrAddrSpace::Global);
+#endif
 
   auto nbytesAttr =
       self.getBuilder().getI32IntegerAttr(static_cast<int32_t>(*nbytesVal));
@@ -640,6 +748,61 @@ void utlx::createGlobalScratchAlloc(TritonOpBuilder &self,
        self.getBuilder().getNamedAttr("alignment", alignmentAttr)});
   if (op && op->getNumResults() > 0)
     operands[0] = op->getResult(0);
+}
+
+/// utlx_make_amd_mfma_layout(result_slot, version, instrShapeM, instrShapeN,
+///                           instrShapeK, isTransposed, warpsPerCTA0,
+///                           warpsPerCTA1)
+///
+/// Builds an AMDMfmaEncodingAttr and returns a value whose RankedTensorType
+/// carries it. The carrier's own shape and element type are immaterial --
+/// consumers (utlx_require_with_layout_carrier,
+/// utlx_require_dot_operand_layout) read only the encoding off this type and
+/// re-apply it to their own operand's shape. This mirrors
+/// createMakeDummyRegisterLayout; a carrier value is used rather than an
+/// attribute because plugin ops can only pass mlir::Values.
+void utlx::createMakeAmdMfmaLayout(TritonOpBuilder &self,
+                                   std::vector<mlir::Value> &operands) {
+  // version, instrShape[3], transposed, then one warpsPerCTA entry per dim
+  // (2 for a matrix, 3 with a leading batch dim).
+  if (operands.size() < 8 || operands.size() > 9)
+    return;
+
+  llvm::SmallVector<unsigned, 8> args;
+  for (size_t i = 1; i < operands.size(); ++i) {
+    auto v = extractConstInt(operands[i]);
+    if (!v)
+      return;
+    args.push_back(static_cast<unsigned>(*v));
+  }
+
+  unsigned version = args[0];
+  llvm::SmallVector<unsigned, 3> instrShape = {args[1], args[2], args[3]};
+  bool isTransposed = args[4] != 0;
+  llvm::SmallVector<unsigned, 3> warpsPerCTA(args.begin() + 5, args.end());
+  unsigned rank = warpsPerCTA.size();
+
+  auto *context = self.getBuilder().getContext();
+  auto CGALayout = ttg::CGAEncodingAttr::get1CTALayout(context, rank);
+  auto encoding = ttg::AMDMfmaEncodingAttr::get(
+      context, version, warpsPerCTA, instrShape, isTransposed, CGALayout);
+
+  // Nominal carrier shape: one full MFMA tile per warp across the CTA (one
+  // batch entry per warp on a leading batch dim). Only the encoding is ever
+  // read back off this type.
+  llvm::SmallVector<int64_t, 3> shape;
+  if (rank == 3)
+    shape.push_back(warpsPerCTA[0]);
+  shape.push_back(static_cast<int64_t>(instrShape[0] * warpsPerCTA[rank - 2]));
+  shape.push_back(static_cast<int64_t>(instrShape[1] * warpsPerCTA[rank - 1]));
+  auto elemTy = self.getBuilder().getF32Type();
+
+  auto tensorType = mlir::RankedTensorType::get(shape, elemTy, encoding);
+  auto nullVal = self.getBuilder().create<mlir::arith::ConstantOp>(
+      self.getLastLoc(),
+      mlir::DenseElementsAttr::get(mlir::RankedTensorType::get(shape, elemTy),
+                                   self.getBuilder().getZeroAttr(elemTy)));
+  operands[0] = self.create<tlx::RequireLayoutOp>(tensorType, nullVal);
 }
 
 /// utlx_make_dummy_register_layout(result_slot, shape..., type_carrier,
@@ -880,4 +1043,127 @@ void utlx::createMakeTensorDescWithDescPtr(TritonOpBuilder &self,
                              allOperands);
   if (op && op->getNumResults() > 0)
     operands[0] = op->getResult(0);
+}
+
+/// utlx_local_slice(result_slot, src, offset0..offsetN-1, shape0..shapeN-1)
+///
+/// Upstream's create_memdesc_subslice binding takes (result_type, src, offsets)
+/// and there is no way to build a MemDescType from Python on upstream Triton,
+/// so compute the result type here and emit the op directly.
+void utlx::createLocalSlice(TritonOpBuilder &self,
+                            std::vector<mlir::Value> &operands) {
+  if (operands.size() < 4)
+    return;
+
+  mlir::Value src = operands[1];
+  auto srcTy = mlir::dyn_cast<ttg::MemDescType>(src.getType());
+  if (!srcTy)
+    return;
+
+  size_t rank = srcTy.getRank();
+  if (operands.size() != 2 + 2 * rank)
+    return;
+
+  llvm::SmallVector<int32_t> offsets;
+  llvm::SmallVector<int64_t> shape;
+  for (size_t i = 0; i < rank; ++i) {
+    auto off = extractConstInt(operands[2 + i]);
+    auto dim = extractConstInt(operands[2 + rank + i]);
+    if (!off || !dim)
+      return;
+    offsets.push_back(static_cast<int32_t>(*off));
+    shape.push_back(*dim);
+  }
+
+  auto newType = ttg::MemDescType::get(
+      shape, srcTy.getElementType(), srcTy.getEncoding(),
+      srcTy.getMemorySpace(), srcTy.getMutableMemory(), srcTy.getAllocShape());
+  operands[0] = self.create<ttg::MemDescSubsliceOp>(newType, src,
+                                                    llvm::ArrayRef(offsets));
+}
+
+// ---------------------------------------------------------------------------
+// utlx_reconcile_region_types
+// ---------------------------------------------------------------------------
+// require_layout gives a value an encoded tensor type while frontend code
+// generation is still in progress. A variable that is plain on one control
+// flow edge and encoded on another, e.g. an accumulator initialised with
+// tl.zeros and reassigned from a require_layout'd value inside a loop, then
+// yields a type that differs from the scf.for iter arg or the scf.if result
+// in encoding alone. Fork TLX's frontend tolerates this; upstream's emits IR
+// that fails verification. The same happens at tt.call and tt.return, whose
+// signatures are built from the frontend types, which do not track encodings
+// picked up from operands (tl.dot with an encoded acc, arithmetic on one).
+// Once the function is finalised, this walks it and casts each such operand to
+// the expected type: release_layout when the expected type is plain,
+// require_layout when it is encoded.
+
+static mlir::Value castEncoding(mlir::OpBuilder &b, mlir::Value v,
+                                mlir::Type expected) {
+  auto srcTy = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
+  auto dstTy = mlir::dyn_cast<mlir::RankedTensorType>(expected);
+  if (!srcTy || !dstTy || srcTy == dstTy ||
+      srcTy.getShape() != dstTy.getShape() ||
+      srcTy.getElementType() != dstTy.getElementType())
+    return {};
+  if (!dstTy.getEncoding())
+    return tlx::ReleaseLayoutOp::create(b, v.getLoc(), dstTy, v);
+  return tlx::RequireLayoutOp::create(b, v.getLoc(), dstTy, v);
+}
+
+static void reconcileOperands(mlir::Operation *terminator,
+                              mlir::TypeRange expected) {
+  mlir::OpBuilder b(terminator);
+  unsigned first = terminator->getNumOperands() - expected.size();
+  for (auto [i, type] : llvm::enumerate(expected)) {
+    mlir::OpOperand &operand = terminator->getOpOperand(first + i);
+    if (mlir::Value cast = castEncoding(b, operand.get(), type))
+      operand.set(cast);
+  }
+}
+
+void utlx::createReconcileRegionTypes(TritonOpBuilder &self,
+                                      std::vector<mlir::Value> &operands) {
+  mlir::Block *block = self.getBuilder().getInsertionBlock();
+  mlir::Operation *fn = block ? block->getParentOp() : nullptr;
+  if (fn && !mlir::isa<mlir::triton::FuncOp>(fn))
+    fn = fn->getParentOfType<mlir::triton::FuncOp>();
+  if (!fn)
+    return;
+  auto funcOp = mlir::cast<mlir::triton::FuncOp>(fn);
+  // The frontend rebuilds the signature from its own argument types once the
+  // returns are known, dropping a descriptor layout that
+  // utlx_match_tensor_desc_layout gave an entry block argument. The block
+  // argument is what the body was built against; follow it.
+  mlir::TypeRange argTypes = funcOp.front().getArgumentTypes();
+  if (argTypes != funcOp.getFunctionType().getInputs())
+    funcOp.setFunctionType(mlir::FunctionType::get(
+        funcOp.getContext(), argTypes, funcOp.getResultTypes()));
+  mlir::FunctionType fnType = funcOp.getFunctionType();
+  fn->walk([&](mlir::Operation *op) {
+    mlir::Operation *parent = op->getParentOp();
+    if (auto yield = mlir::dyn_cast<mlir::scf::YieldOp>(op)) {
+      if (auto forOp = mlir::dyn_cast<mlir::scf::ForOp>(parent))
+        reconcileOperands(
+            yield, mlir::ValueRange(forOp.getRegionIterArgs()).getTypes());
+      else if (auto whileOp = mlir::dyn_cast<mlir::scf::WhileOp>(parent))
+        reconcileOperands(
+            yield, mlir::ValueRange(whileOp.getBeforeArguments()).getTypes());
+      else if (mlir::isa<mlir::scf::IfOp, mlir::scf::ExecuteRegionOp>(parent))
+        reconcileOperands(yield, parent->getResultTypes());
+    } else if (auto cond = mlir::dyn_cast<mlir::scf::ConditionOp>(op)) {
+      // getArgs() excludes the condition, which reconcileOperands skips.
+      auto whileOp = mlir::cast<mlir::scf::WhileOp>(parent);
+      reconcileOperands(
+          cond, mlir::ValueRange(whileOp.getAfterArguments()).getTypes());
+    } else if (auto ret = mlir::dyn_cast<mlir::triton::ReturnOp>(op)) {
+      reconcileOperands(ret, fnType.getResults());
+    } else if (auto call = mlir::dyn_cast<mlir::triton::CallOp>(op)) {
+      // Callees are generated, and finalised, before their first call.
+      if (auto callee =
+              mlir::SymbolTable::lookupNearestSymbolFrom<mlir::triton::FuncOp>(
+                  call, call.getCalleeAttr()))
+        reconcileOperands(call, callee.getFunctionType().getInputs());
+    }
+  });
 }

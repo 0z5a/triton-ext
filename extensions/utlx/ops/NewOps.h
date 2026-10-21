@@ -20,6 +20,7 @@ void createAsyncCLCTryCancel(TritonOpBuilder &, std::vector<mlir::Value> &);
 void createCLCQueryCancel(TritonOpBuilder &, std::vector<mlir::Value> &);
 void createVoteBallotSync(TritonOpBuilder &, std::vector<mlir::Value> &);
 void createAsyncTMAPrefetch(TritonOpBuilder &, std::vector<mlir::Value> &);
+void createMatchTensorDescLayout(TritonOpBuilder &, std::vector<mlir::Value> &);
 void createNamedBarrierArrive(TritonOpBuilder &, std::vector<mlir::Value> &);
 void createNamedBarrierWait(TritonOpBuilder &, std::vector<mlir::Value> &);
 
@@ -42,11 +43,19 @@ void createRequireTensorMemoryLayout(TritonOpBuilder &,
 void createRequireTensorMemoryScalesLayout(TritonOpBuilder &,
                                            std::vector<mlir::Value> &);
 
+// Layout-carrier constructors (build an encoding, return a value whose type
+// carries it; consumed by utlx_require_with_layout_carrier and
+// utlx_require_dot_operand_layout)
+void createMakeAmdMfmaLayout(TritonOpBuilder &, std::vector<mlir::Value> &);
+void createMakeSliceLayout(TritonOpBuilder &, std::vector<mlir::Value> &);
+void createLocalSlice(TritonOpBuilder &, std::vector<mlir::Value> &);
+
 // Memory ops
 void createAsyncLoad(TritonOpBuilder &, std::vector<mlir::Value> &);
 void createGlobalScratchAlloc(TritonOpBuilder &, std::vector<mlir::Value> &);
 void createMakeDummyRegisterLayout(TritonOpBuilder &,
                                    std::vector<mlir::Value> &);
+void createReconcileRegionTypes(TritonOpBuilder &, std::vector<mlir::Value> &);
 void createRequireWithLayoutCarrier(TritonOpBuilder &,
                                     std::vector<mlir::Value> &);
 void createAllocClcResponses(TritonOpBuilder &, std::vector<mlir::Value> &);
